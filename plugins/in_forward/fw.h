@@ -22,9 +22,10 @@
 
 #include <msgpack.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_log_event_decoder.h>
+#include <fluent-bit/flb_log_event_encoder.h>
 
 struct flb_in_fw_config {
-    int server_fd;                  /* TCP server file descriptor  */
     size_t buffer_max_size;         /* Max Buffer size             */
     size_t buffer_chunk_size;       /* Chunk allocation size       */
 
@@ -34,13 +35,18 @@ struct flb_in_fw_config {
 
     flb_sds_t tag_prefix;           /* tag prefix                  */
 
-    /* Unix Socket (TCP only) */
+    /* Unix Socket */
     char *unix_path;                /* Unix path for socket        */
+    unsigned int unix_perm;         /* Permission for socket       */
+    flb_sds_t unix_perm_str;        /* Permission (config map)     */
 
     int coll_fd;
+    struct flb_downstream *downstream; /* Client manager          */
     struct mk_list connections;     /* List of active connections */
-    struct mk_event_loop *evl;      /* Event loop file descriptor */
     struct flb_input_instance *ins; /* Input plugin instace       */
+
+    struct flb_log_event_decoder *log_decoder;
+    struct flb_log_event_encoder *log_encoder;
 };
 
 #endif

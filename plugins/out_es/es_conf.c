@@ -24,7 +24,7 @@
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/flb_signv4.h>
 #include <fluent-bit/flb_aws_credentials.h>
-#include <mbedtls/base64.h>
+#include <fluent-bit/flb_base64.h>
 
 #include "es.h"
 #include "es_conf.h"
@@ -44,6 +44,7 @@ static flb_sds_t extract_cloud_host(struct flb_elasticsearch *ctx,
     char *colon;
     char *region;
     char *host;
+    char *port = NULL;
     char buf[256] = {0};
     char cloud_host_buf[256] = {0};
     const char dollar[2] = "$";
@@ -58,7 +59,7 @@ static flb_sds_t extract_cloud_host(struct flb_elasticsearch *ctx,
     colon++;
 
     /* decode base64 */
-    ret = mbedtls_base64_decode((unsigned char *)buf, sizeof(buf), &len, (unsigned char *)colon, strlen(colon));
+    ret = flb_base64_decode((unsigned char *)buf, sizeof(buf), &len, (unsigned char *)colon, strlen(colon));
     if (ret) {
         flb_plg_error(ctx->ins, "cannot decode cloud_id");
         return NULL;
@@ -71,9 +72,27 @@ static flb_sds_t extract_cloud_host(struct flb_elasticsearch *ctx,
     if (host == NULL) {
         return NULL;
     }
+
+    /*
+     * Some cloud id format is "<deployment_region>$<elasticsearch_hostname>:<port>$<kibana_hostname>" .
+     *   e.g. https://github.com/elastic/beats/blob/v8.4.1/libbeat/cloudid/cloudid_test.go#L60
+     *
+     * It means the variable "host" can contains ':' and port number.
+     */
+    colon = strchr(host, ':');
+    if (colon != NULL) {
+        /* host contains host number */
+        *colon = '\0'; /* remove port number from host */
+        port = colon+1;
+    }
+
     strcpy(cloud_host_buf, host);
     strcat(cloud_host_buf, ".");
     strcat(cloud_host_buf, region);
+    if (port != NULL) {
+        strcat(cloud_host_buf, ":");
+        strcat(cloud_host_buf, port);
+    }
     return flb_sds_create(cloud_host_buf);
 }
 
@@ -122,7 +141,10 @@ struct flb_elasticsearch *flb_es_conf_create(struct flb_output_instance *ins,
     char *aws_external_id = NULL;
     char *aws_session_name = NULL;
 #endif
+    char *cloud_port_char;
     char *cloud_host = NULL;
+    int cloud_host_port = 0;
+    int cloud_port = FLB_ES_DEFAULT_HTTPS_PORT;
     struct flb_uri *uri = ins->host.uri;
     struct flb_uri_field *f_index = NULL;
     struct flb_uri_field *f_type = NULL;
@@ -153,8 +175,36 @@ struct flb_elasticsearch *flb_es_conf_create(struct flb_output_instance *ins,
             flb_es_conf_destroy(ctx);
             return NULL;
         }
+        flb_plg_debug(ctx->ins, "extracted cloud_host: '%s'", cloud_host);
+
+        cloud_port_char = strchr(cloud_host, ':');
+
+	if (cloud_port_char == NULL) {
+            flb_plg_debug(ctx->ins, "cloud_host: '%s' does not contain a port: '%s'", cloud_host, cloud_host);
+        }
+        else {
+            cloud_port_char[0] = '\0';
+            cloud_port_char = &cloud_port_char[1];
+            flb_plg_debug(ctx->ins, "extracted cloud_port_char: '%s'", cloud_port_char);
+            cloud_host_port = (int) strtol(cloud_port_char, (char **) NULL, 10);
+            flb_plg_debug(ctx->ins, "converted cloud_port_char to port int: '%i'", cloud_host_port);
+	}
+
+        if (cloud_host_port == 0) {
+            cloud_host_port = cloud_port;
+        }
+
+        flb_plg_debug(ctx->ins,
+                      "checked whether extracted port was null and set it to "
+                      "default https port or not. Outcome: '%i' and cloud_host: '%s'.",
+                      cloud_host_port, cloud_host);
+
+        if (ins->host.name != NULL) {
+            flb_sds_destroy(ins->host.name);
+        }
+
         ins->host.name = cloud_host;
-        ins->host.port = 443;
+        ins->host.port = cloud_host_port;
     }
 
     /* Set default network configuration */
@@ -184,6 +234,15 @@ struct flb_elasticsearch *flb_es_conf_create(struct flb_output_instance *ins,
 
     if (ins->host.ipv6 == FLB_TRUE) {
         io_flags |= FLB_IO_IPV6;
+    }
+
+    /* Compress (gzip) */
+    tmp = flb_output_get_property("compress", ins);
+    ctx->compress_gzip = FLB_FALSE;
+    if (tmp) {
+        if (strcasecmp(tmp, "gzip") == 0) {
+            ctx->compress_gzip = FLB_TRUE;
+        }
     }
 
     /* Prepare an upstream handler */
@@ -294,6 +353,18 @@ struct flb_elasticsearch *flb_es_conf_create(struct flb_output_instance *ins,
     }
 
 #ifdef FLB_HAVE_AWS
+    /* AWS Auth Unsigned Headers */
+    ctx->aws_unsigned_headers = flb_malloc(sizeof(struct mk_list));
+    if (ret != 0) {
+        flb_es_conf_destroy(ctx);
+    }
+    flb_slist_create(ctx->aws_unsigned_headers);
+    ret = flb_slist_add(ctx->aws_unsigned_headers, "Content-Length");
+    if (ret != 0) {
+        flb_es_conf_destroy(ctx);
+        return NULL;
+    }
+
     /* AWS Auth */
     ctx->has_aws_auth = FLB_FALSE;
     tmp = flb_output_get_property("aws_auth", ins);
@@ -303,7 +374,8 @@ struct flb_elasticsearch *flb_es_conf_create(struct flb_output_instance *ins,
             flb_debug("[out_es] Enabled AWS Auth");
 
             /* AWS provider needs a separate TLS instance */
-            ctx->aws_tls = flb_tls_create(FLB_TRUE,
+            ctx->aws_tls = flb_tls_create(FLB_TLS_CLIENT_MODE,
+                                          FLB_TRUE,
                                           ins->tls_debug,
                                           ins->tls_vhost,
                                           ins->tls_ca_path,
@@ -335,7 +407,8 @@ struct flb_elasticsearch *flb_es_conf_create(struct flb_output_instance *ins,
                                                                    ctx->aws_region,
                                                                    ctx->aws_sts_endpoint,
                                                                    NULL,
-                                                                   flb_aws_client_generator());
+                                                                   flb_aws_client_generator(),
+                                                                   ctx->aws_profile);
             if (!ctx->aws_provider) {
                 flb_error("[out_es] Failed to create AWS Credential Provider");
                 flb_es_conf_destroy(ctx);
@@ -362,7 +435,8 @@ struct flb_elasticsearch *flb_es_conf_create(struct flb_output_instance *ins,
                 }
 
                 /* STS provider needs yet another separate TLS instance */
-                ctx->aws_sts_tls = flb_tls_create(FLB_TRUE,
+                ctx->aws_sts_tls = flb_tls_create(FLB_TLS_CLIENT_MODE,
+                                                  FLB_TRUE,
                                                   ins->tls_debug,
                                                   ins->tls_vhost,
                                                   ins->tls_ca_path,
@@ -443,6 +517,11 @@ int flb_es_conf_destroy(struct flb_elasticsearch *ctx)
 
     if (ctx->aws_sts_tls) {
         flb_tls_destroy(ctx->aws_sts_tls);
+    }
+
+    if (ctx->aws_unsigned_headers) {
+        flb_slist_destroy(ctx->aws_unsigned_headers);
+        flb_free(ctx->aws_unsigned_headers);
     }
 #endif
 

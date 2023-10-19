@@ -70,6 +70,7 @@ struct flb_aws_imds *flb_aws_imds_create(const struct flb_aws_imds_config *imds_
      */
     ctx->imds_version = imds_config->use_imds_version;
     ctx->imds_v2_token = flb_sds_create_len("INVALID_TOKEN", 13);
+    ctx->imds_v2_token_len = 13;
 
     /* Detect IMDS support */
     if (!ec2_imds_client->upstream) {
@@ -167,14 +168,23 @@ int flb_aws_imds_request_by_key(struct flb_aws_imds *ctx, const char *metadata_p
         flb_debug("[imds] refreshed IMDSv2 token");
         c = ec2_imds_client->client_vtable->request(
             ec2_imds_client, FLB_HTTP_GET, metadata_path, NULL, 0, &token_header, 1);
+        if (!c) {
+            /* Exit gracefully allowing for retries */
+            flb_warn("[imds] failed to retrieve metadata");
+            return -1;
+        }
     }
 
     if (c->resp.status != 200) {
+        ret = -1;
+        if (c->resp.status == 404) {
+            ret = -2;
+        }
         if (c->resp.payload_size > 0) {
             flb_debug("[imds] metadata request failure response\n%s", c->resp.payload);
         }
         flb_http_client_destroy(c);
-        return -1;
+        return ret;
     }
 
     if (key != NULL) {

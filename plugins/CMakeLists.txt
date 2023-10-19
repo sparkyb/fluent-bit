@@ -107,6 +107,42 @@ macro(REGISTER_OUT_PLUGIN name)
   endif()
 endmacro()
 
+
+# REGISTER_PROCESSOR_PLUGIN
+macro(REGISTER_PROCESSOR_PLUGIN name)
+  string(FIND ${name} "=" pos)
+  if(pos GREATER -1)
+    string(REPLACE "=" ";" list ${name})
+    list(GET list 0 p_name)
+    list(GET list 1 p_path)
+    message(STATUS "EXTERNAL PROCESSOR PLUGIN name='${p_name}' path='${p_path}'")
+  else()
+    set(p_name ${name})
+  endif()
+
+  string(TOUPPER ${p_name} NAME)
+  if(FLB_${NAME} OR p_path)
+    set(FLB_PROCESSOR_PLUGINS_DECL "${FLB_PROCESSOR_PLUGINS_DECL}extern struct flb_processor_plugin ${p_name}_plugin;\n")
+
+    # C code
+    set(C_CODE          "    processor = flb_malloc(sizeof(struct flb_processor_plugin));\n")
+    set(C_CODE "${C_CODE}    if (!processor) {\n")
+    set(C_CODE "${C_CODE}        flb_errno();\n")
+    set(C_CODE "${C_CODE}        return -1;\n")
+    set(C_CODE "${C_CODE}    }\n")
+    set(C_CODE "${C_CODE}    memcpy(processor, &${p_name}_plugin, sizeof(struct flb_processor_plugin));\n")
+    set(C_CODE "${C_CODE}    mk_list_add(&processor->_head, &config->processor_plugins);\n\n")
+
+    set(FLB_PROCESSOR_PLUGINS_ADD "${FLB_PROCESSOR_PLUGINS_ADD}${C_CODE}")
+    if (p_path)
+      add_subdirectory(${p_path} ${p_path})
+    else()
+      add_subdirectory(${p_name})
+    endif()
+    set(flb_plugins "${flb_plugins}flb-plugin-${p_name};")
+  endif()
+endmacro()
+
 # REGISTER_FILTER_PLUGIN
 macro(REGISTER_FILTER_PLUGIN name)
   string(FIND ${name} "=" pos)
@@ -169,22 +205,36 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
   REGISTER_IN_PLUGIN("in_netif")
   REGISTER_IN_PLUGIN("in_docker")
   REGISTER_IN_PLUGIN("in_docker_events")
+  REGISTER_IN_PLUGIN("in_podman_metrics")
+endif()
+
+if(${CMAKE_SYSTEM_NAME} MATCHES "Linux" OR ${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
   REGISTER_IN_PLUGIN("in_node_exporter_metrics")
 endif()
 
+REGISTER_IN_PLUGIN("in_kubernetes_events")
 REGISTER_IN_PLUGIN("in_kafka")
 REGISTER_IN_PLUGIN("in_fluentbit_metrics")
 REGISTER_IN_PLUGIN("in_prometheus_scrape")
 REGISTER_IN_PLUGIN("in_emitter")
 REGISTER_IN_PLUGIN("in_tail")
 REGISTER_IN_PLUGIN("in_dummy")
-REGISTER_IN_PLUGIN("in_dummy_thread")
 REGISTER_IN_PLUGIN("in_head")
 REGISTER_IN_PLUGIN("in_health")
 REGISTER_IN_PLUGIN("in_http")
 REGISTER_IN_PLUGIN("in_collectd")
 REGISTER_IN_PLUGIN("in_statsd")
 REGISTER_IN_PLUGIN("in_opentelemetry")
+REGISTER_IN_PLUGIN("in_elasticsearch")
+REGISTER_IN_PLUGIN("in_calyptia_fleet")
+REGISTER_IN_PLUGIN("in_splunk")
+
+# Test the event loop messaging when used in threaded mode
+REGISTER_IN_PLUGIN("in_event_test")
+
+# Send different event types: logs, metrics and traces
+REGISTER_IN_PLUGIN("in_event_type")
+
 
 if (FLB_IN_STORAGE_BACKLOG)
   REGISTER_IN_PLUGIN("in_storage_backlog")
@@ -215,13 +265,30 @@ if(FLB_PARSER)
   REGISTER_IN_PLUGIN("in_exec")
 endif()
 
+REGISTER_IN_PLUGIN("in_udp")
+
+if(FLB_WASM)
+  REGISTER_IN_PLUGIN("in_exec_wasi")
+endif()
+
 REGISTER_IN_PLUGIN("in_tcp")
+REGISTER_IN_PLUGIN("in_unix_socket")
 REGISTER_IN_PLUGIN("in_mqtt")
 REGISTER_IN_PLUGIN("in_lib")
 REGISTER_IN_PLUGIN("in_forward")
 REGISTER_IN_PLUGIN("in_random")
+
+# PROCESSORS
+# ==========
+REGISTER_PROCESSOR_PLUGIN("processor_labels")
+REGISTER_PROCESSOR_PLUGIN("processor_attributes")
+
+# OUTPUTS
+# =======
 REGISTER_OUT_PLUGIN("out_azure")
 REGISTER_OUT_PLUGIN("out_azure_blob")
+REGISTER_OUT_PLUGIN("out_azure_logs_ingestion")
+REGISTER_OUT_PLUGIN("out_azure_kusto")
 REGISTER_OUT_PLUGIN("out_bigquery")
 REGISTER_OUT_PLUGIN("out_calyptia")
 REGISTER_OUT_PLUGIN("out_counter")
@@ -240,6 +307,7 @@ REGISTER_OUT_PLUGIN("out_nats")
 REGISTER_OUT_PLUGIN("out_nrlogs")
 REGISTER_OUT_PLUGIN("out_null")
 REGISTER_OUT_PLUGIN("out_opensearch")
+REGISTER_OUT_PLUGIN("out_oracle_log_analytics")
 
 if (NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
   REGISTER_OUT_PLUGIN("out_plot")
@@ -254,6 +322,7 @@ REGISTER_OUT_PLUGIN("out_stackdriver")
 REGISTER_OUT_PLUGIN("out_stdout")
 REGISTER_OUT_PLUGIN("out_syslog")
 REGISTER_OUT_PLUGIN("out_tcp")
+REGISTER_OUT_PLUGIN("out_udp")
 REGISTER_OUT_PLUGIN("out_td")
 REGISTER_OUT_PLUGIN("out_lib")
 REGISTER_OUT_PLUGIN("out_flowcounter")
@@ -266,12 +335,15 @@ REGISTER_OUT_PLUGIN("out_opentelemetry")
 REGISTER_OUT_PLUGIN("out_prometheus_exporter")
 REGISTER_OUT_PLUGIN("out_prometheus_remote_write")
 REGISTER_OUT_PLUGIN("out_s3")
+REGISTER_OUT_PLUGIN("out_vivo_exporter")
+REGISTER_OUT_PLUGIN("out_chronicle")
 
 # FILTERS
 # =======
 REGISTER_FILTER_PLUGIN("filter_alter_size")
 REGISTER_FILTER_PLUGIN("filter_aws")
 REGISTER_FILTER_PLUGIN("filter_checklist")
+REGISTER_FILTER_PLUGIN("filter_ecs")
 REGISTER_FILTER_PLUGIN("filter_record_modifier")
 REGISTER_FILTER_PLUGIN("filter_throttle")
 REGISTER_FILTER_PLUGIN("filter_throttle_size")
@@ -292,6 +364,10 @@ if(FLB_RECORD_ACCESSOR)
   REGISTER_FILTER_PLUGIN("filter_rewrite_tag")
 endif()
 
+if(FLB_METRICS)
+  REGISTER_FILTER_PLUGIN("filter_log_to_metrics")
+endif()
+
 if(FLB_LUAJIT)
   REGISTER_FILTER_PLUGIN("filter_lua")
 endif()
@@ -301,6 +377,9 @@ REGISTER_FILTER_PLUGIN("filter_stdout")
 REGISTER_FILTER_PLUGIN("filter_geoip2")
 
 REGISTER_FILTER_PLUGIN("filter_nightfall")
+if (FLB_WASM)
+  REGISTER_FILTER_PLUGIN("filter_wasm")
+endif ()
 
 # Register external input and output plugins
 if(EXT_IN_PLUGINS)
@@ -314,6 +393,13 @@ if(EXT_OUT_PLUGINS)
   string(REPLACE "," ";" plugins ${EXT_OUT_PLUGINS})
   foreach(entry ${plugins})
     REGISTER_OUT_PLUGIN(${entry})
+  endforeach()
+endif()
+
+if(EXT_PROCESSOR_PLUGINS)
+  string(REPLACE "," ";" plugins ${EXT_PROCESSOR_PLUGINS})
+  foreach(entry ${plugins})
+    REGISTER_PROCESSOR_PLUGIN(${entry})
   endforeach()
 endif()
 

@@ -29,6 +29,7 @@
 /* Upload data to S3 in 5MB chunks */
 #define MIN_CHUNKED_UPLOAD_SIZE 5242880
 #define MAX_CHUNKED_UPLOAD_SIZE 50000000
+#define MAX_CHUNKED_UPLOAD_COMPRESS_SIZE 5000000000
 
 #define UPLOAD_TIMER_MAX_WAIT 60000
 #define UPLOAD_TIMER_MIN_WAIT 6000
@@ -41,7 +42,8 @@
 #define MAX_FILE_SIZE         50000000000
 #define MAX_FILE_SIZE_STR     "50,000,000,000"
 
-#define MAX_FILE_SIZE_PUT_OBJECT         50000000
+/* Allowed max file size 1 GB for publishing to S3 */
+#define MAX_FILE_SIZE_PUT_OBJECT        1000000000 
 
 #define DEFAULT_UPLOAD_TIMEOUT 3600
 
@@ -59,7 +61,7 @@
 struct upload_queue {
     struct s3_file *upload_file;
     struct multipart_upload *m_upload_file;
-    char *tag;
+    flb_sds_t tag;
     int tag_len;
 
     int retry_counter;
@@ -107,8 +109,10 @@ struct flb_s3 {
     char *sts_endpoint;
     char *canned_acl;
     char *content_type;
+    char *storage_class;
     char *log_key;
     char *external_id;
+    char *profile;
     int free_endpoint;
     int retry_requests;
     int use_put_object;
@@ -117,6 +121,10 @@ struct flb_s3 {
     int compression;
     int port;
     int insecure;
+    size_t store_dir_limit_size;
+
+    /* track the total amount of buffered data */
+    size_t current_buffer_size;
 
     struct flb_aws_provider *provider;
     struct flb_aws_provider *base_provider;
@@ -187,5 +195,9 @@ struct flb_http_client *mock_s3_call(char *error_env_var, char *api);
 int s3_plugin_under_test();
 
 int get_md5_base64(char *buf, size_t buf_size, char *md5_str, size_t md5_str_size);
+
+int create_headers(struct flb_s3 *ctx, char *body_md5,
+                   struct flb_aws_header **headers, int *num_headers,
+                   int multipart_upload);
 
 #endif

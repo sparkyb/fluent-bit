@@ -38,52 +38,6 @@ struct expect_str {
 pthread_mutex_t result_mutex = PTHREAD_MUTEX_INITIALIZER;
 int  num_output = 0;
 
-/* Callback to check expected results */
-static int cb_check_result(void *record, size_t size, void *data)
-{
-    char *p;
-    char *result;
-    struct expect_str *expected;
-
-    expected = (struct expect_str*)data;
-    result = (char *) record;
-
-    if (!TEST_CHECK(expected != NULL)) {
-        flb_error("expected is NULL");
-    }
-    if (!TEST_CHECK(result != NULL)) {
-        flb_error("result is NULL");
-    }
-
-    while(expected != NULL && expected->str != NULL) {
-        if (expected->found == FLB_TRUE) {
-            p = strstr(result, expected->str);
-            if(!TEST_CHECK(p != NULL)) {
-                flb_error("Expected to find: '%s' in result '%s'",
-                          expected->str, result);
-            }
-        }
-        else {
-            p = strstr(result, expected->str);
-            if(!TEST_CHECK(p == NULL)) {
-                flb_error("'%s' should be removed in result '%s'",
-                          expected->str, result);
-            }
-        }
-
-        /*
-         * If you want to debug your test
-         *
-         * printf("Expect: '%s' in result '%s'", expected, result);
-         */
-
-        expected++;
-    }
-
-    flb_free(record);
-    return 0;
-}
-
 static int cb_count_msgpack(void *record, size_t size, void *data)
 {
     msgpack_unpacked result;
@@ -551,6 +505,53 @@ static void flb_test_issue_4518()
     filter_test_destroy(ctx);
 }
 
+/* $TAG as a key of rule causes SIGSEGV */
+static void flb_test_issue_5846()
+{
+    struct flb_lib_out_cb cb_data;
+    struct filter_test *ctx;
+    int ret;
+    int not_used = 0;
+    int bytes;
+    char *p = "[0, {\"key\":\"rewrite\"}]";
+
+    /* Prepare output callback with expected result */
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &not_used;
+
+    /* Create test context */
+    ctx = filter_test_create((void *) &cb_data);
+    if (!ctx) {
+        exit(EXIT_FAILURE);
+    }
+    clear_output_num();
+    /* Configure filter */
+    ret = flb_filter_set(ctx->flb, ctx->f_ffd,
+                         "Rule", "$TAG ^(rewrite)$ updated false",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Configure output */
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "Match", "updated",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Start the engine */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    /* ingest record */
+    bytes = flb_lib_push(ctx->flb, ctx->i_ffd, p, strlen(p));
+    TEST_CHECK(bytes == strlen(p));
+
+    flb_time_msleep(1500); /* waiting flush */
+
+    /* It is OK, if there is no SIGSEGV. */
+
+    filter_test_destroy(ctx);
+}
+
 TEST_LIST = {
     {"matched",          flb_test_matched},
     {"not_matched",      flb_test_not_matched},
@@ -558,5 +559,6 @@ TEST_LIST = {
     {"heavy_input_pause_emitter", flb_test_heavy_input_pause_emitter},
     {"issue_4518", flb_test_issue_4518},
     {"issue_4793", flb_test_issue_4793},
+    {"sigsegv_issue_5846", flb_test_issue_5846},
     {NULL, NULL}
 };

@@ -110,6 +110,14 @@ void flb_utils_error(int err)
     case FLB_ERR_CORO_STACK_SIZE:
         msg = "invalid coroutine stack size";
         break;
+    case FLB_ERR_CFG_PLUGIN_FILE:
+        msg = "plugins_file not found";
+        break;
+    case FLB_ERR_RELOADING_IN_PROGRESS:
+        msg = "reloading in progress";
+        break;
+    default:
+        flb_error("(error message is not defined. err=%d)", err);
     }
 
     if (!msg) {
@@ -160,9 +168,9 @@ int flb_utils_set_daemon(struct flb_config *config)
     pid_t pid;
 
     if ((pid = fork()) < 0){
-		flb_error("Failed creating to switch to daemon mode (fork failed)");
+        flb_error("Failed creating to switch to daemon mode (fork failed)");
         exit(EXIT_FAILURE);
-	}
+    }
 
     if (pid > 0) { /* parent */
         exit(EXIT_SUCCESS);
@@ -177,7 +185,7 @@ int flb_utils_set_daemon(struct flb_config *config)
     if (chdir("/") < 0) { /* make sure we can unmount the inherited filesystem */
         flb_error("Unable to unmount the inherited filesystem");
         exit(EXIT_FAILURE);
-	}
+    }
 
     /* Our last STDOUT messages */
     flb_info("switching to background mode (PID=%ld)", (long) getpid());
@@ -192,6 +200,7 @@ int flb_utils_set_daemon(struct flb_config *config)
 void flb_utils_print_setup(struct flb_config *config)
 {
     struct mk_list *head;
+    struct mk_list *head_tmp;
     struct flb_input_plugin *plugin;
     struct flb_input_collector *collector;
     struct flb_input_instance *in;
@@ -232,24 +241,137 @@ void flb_utils_print_setup(struct flb_config *config)
     /* Collectors */
     flb_info("___________");
     flb_info(" collectors:");
-    mk_list_foreach(head, &config->collectors) {
-        collector = mk_list_entry(head, struct flb_input_collector, _head);
-        plugin = collector->instance->p;
+    mk_list_foreach(head, &config->inputs) {
+        in = mk_list_entry(head, struct flb_input_instance, _head);
+        mk_list_foreach(head_tmp, &in->collectors) {
+            collector = mk_list_entry(head_tmp, struct flb_input_collector, _head);
+            plugin = collector->instance->p;
 
-        if (collector->seconds > 0) {
-            flb_info("[%s %lus,%luns] ",
-                      plugin->name,
-                      collector->seconds,
-                      collector->nanoseconds);
+            if (collector->seconds > 0) {
+                flb_info("[%s %lus,%luns] ",
+                          plugin->name,
+                          collector->seconds,
+                          collector->nanoseconds);
+            }
+            else {
+                flb_info("     [%s] ", plugin->name);
+            }
         }
-        else {
-            flb_info("     [%s] ", plugin->name);
-        }
-
     }
 }
 
-struct mk_list *flb_utils_split(const char *line, int separator, int max_split)
+/*
+ * quoted_string_len returns the length of a quoted string, not including the quotes.
+ */
+static int quoted_string_len(const char *str)
+{
+    int len = 0;
+    char quote = *str++; /* Consume the quote character. */
+
+    while (quote != 0) {
+        char c = *str++;
+        switch (c) {
+            case '\0':
+                /* Error: string ends before end-quote was seen. */
+                return -1;
+            case '\\':
+                /* Skip escaped quote or \\. */
+                if (*str == quote || *str == '\\') {
+                    str++;
+                }
+                break;
+            case '\'':
+            case '"':
+                /* End-quote seen: stop iterating. */
+                if (c == quote) {
+                    quote = 0;
+                }
+                break;
+            default:
+                break;
+        }
+        len++;
+    }
+
+    /* Go back one character to ignore end-quote */
+    len--;
+
+    return len;
+}
+
+/*
+ * next_token returns the next token in the string 'str' delimited by 'separator'.
+ * 'out' is set to the beginning of the token.
+ * 'out_len' is set to the length of the token.
+ * 'parse_quotes' is set to FLB_TRUE when quotes shall be considered when tokenizing the 'str'.
+ * The function returns offset to next token in the string.
+ */
+static int next_token(const char *str, int separator, char **out, int *out_len, int parse_quotes) {
+    const char *token_in = str;
+    char *token_out;
+    int next_separator = 0;
+    int quote = 0; /* Parser state: 0 not inside quoted string, or '"' or '\'' when inside quoted string. */
+    int len = 0;
+    int i;
+
+    /* Skip leading separators. */
+    while (*token_in == separator) {
+        token_in++;
+    }
+
+    /* Should quotes be parsed? Or is token quoted? If not, copy until separator or the end of string. */
+    if (parse_quotes == FLB_FALSE || (*token_in != '"' && *token_in != '\'')) {
+        len = (int)strlen(token_in);
+        next_separator = mk_string_char_search(token_in, separator, len);
+        if (next_separator > 0) {
+            len = next_separator;
+        }
+        *out_len = len;
+        *out = mk_string_copy_substr(token_in, 0, len);
+        if (*out == NULL) {
+            return -1;
+        }
+
+        return (int)(token_in - str) + len;
+    }
+
+    /* Token is quoted. */
+
+    len = quoted_string_len(token_in);
+    if (len < 0) {
+        return -1;
+    }
+
+    /* Consume the quote character. */
+    quote = *token_in++;
+
+    token_out = flb_malloc(len + 1);
+    if (!token_out) {
+        return -1;
+    }
+
+    /* Copy the token */
+    for (i = 0; i < len; i++) {
+        /* Handle escapes when inside quoted token:
+         *   \" -> "
+         *   \' -> '
+         *   \\ -> \
+         */
+        if (*token_in == '\\' && (token_in[1] == quote || token_in[1] == '\\')) {
+            token_in++;
+        }
+        token_out[i] = *token_in++;
+    }
+    token_out[i] = '\0';
+
+    *out = token_out;
+    *out_len = len;
+
+    return (int)(token_in - str);
+}
+
+
+static struct mk_list *split(const char *line, int separator, int max_split, int quoted)
 {
     int i = 0;
     int count = 0;
@@ -273,26 +395,15 @@ struct mk_list *flb_utils_split(const char *line, int separator, int max_split)
 
     len = strlen(line);
     while (i < len) {
-        end = mk_string_char_search(line + i, separator, len - i);
-        if (end >= 0 && end + i < len) {
-            end += i;
-
-            if (i == (unsigned int) end) {
-                i++;
-                continue;
-            }
-
-            val = mk_string_copy_substr(line, i, end);
-            val_len = end - i;
-        }
-        else {
-            val = mk_string_copy_substr(line, i, len);
-            val_len = len - i;
-            end = len;
+        end = next_token(line + i, separator, &val, &val_len, quoted);
+        if (end == -1) {
+            flb_error("Parsing failed: %s", line);
+            flb_utils_split_free(list);
+            return NULL;
         }
 
         /* Update last position */
-        i = end;
+        i += end;
 
         /* Create new entry */
         new = flb_malloc(sizeof(struct flb_split_entry));
@@ -332,6 +443,17 @@ struct mk_list *flb_utils_split(const char *line, int separator, int max_split)
 
     return list;
 }
+
+struct mk_list *flb_utils_split_quoted(const char *line, int separator, int max_split)
+{
+    return split(line, separator, max_split, FLB_TRUE);
+}
+
+struct mk_list *flb_utils_split(const char *line, int separator, int max_split)
+{
+    return split(line, separator, max_split, FLB_FALSE);
+}
+
 
 void flb_utils_split_free_entry(struct flb_split_entry *entry)
 {
@@ -1037,7 +1159,7 @@ int flb_utils_proxy_url_split(const char *in_url, char **out_protocol,
     proto_sep += 3;
 
     /* Seperate `username:password` and `host:port` */
-    at_sep = strchr(proto_sep, '@');
+    at_sep = strrchr(proto_sep, '@');
     if (at_sep) {
         /* Parse username:passwrod part. */
         tmp = strchr(proto_sep, ':');
@@ -1168,7 +1290,7 @@ int flb_utils_read_file(char *path, char **out_buf, size_t *out_size)
     ret = fstat(fd, &st);
     if (ret == -1) {
         flb_errno();
-        close(fd);
+        fclose(fp);
         return -1;
     }
 
@@ -1181,7 +1303,9 @@ int flb_utils_read_file(char *path, char **out_buf, size_t *out_size)
 
     bytes = fread(buf, st.st_size, 1, fp);
     if (bytes < 1) {
-        flb_errno();
+        if (ferror(fp)) {
+            flb_errno();
+        }
         flb_free(buf);
         fclose(fp);
         return -1;
@@ -1234,19 +1358,23 @@ int flb_utils_get_machine_id(char **out_id, size_t *out_size)
     char *dbus_etc = "/etc/machine-id";
 
     /* dbus */
-    ret = machine_id_read_and_sanitize(dbus_var, &id, &bytes);
-    if (ret == 0) {
-        *out_id = id;
-        *out_size = bytes;
-        return 0;
+    if (access(dbus_var, F_OK) == 0) { /* check if the file exists first */
+        ret = machine_id_read_and_sanitize(dbus_var, &id, &bytes);
+        if (ret == 0) {
+            *out_id = id;
+            *out_size = bytes;
+            return 0;
+        }
     }
 
     /* etc */
-    ret = machine_id_read_and_sanitize(dbus_etc, &id, &bytes);
-    if (ret == 0) {
-        *out_id = id;
-        *out_size = bytes;
-        return 0;
+    if (access(dbus_etc, F_OK) == 0) { /* check if the file exists first */
+        ret = machine_id_read_and_sanitize(dbus_etc, &id, &bytes);
+        if (ret == 0) {
+            *out_id = id;
+            *out_size = bytes;
+            return 0;
+        }
     }
 #elif defined(__FreeBSD__) || defined(__NetBSD__) || \
       defined(__OpenBSD__) || defined(__DragonFly__)
@@ -1258,6 +1386,36 @@ int flb_utils_get_machine_id(char **out_id, size_t *out_size)
     if (ret == 0) {
         *out_id = id;
         *out_size = bytes;
+        return 0;
+    }
+#elif defined(FLB_SYSTEM_WINDOWS)
+    LSTATUS status;
+    HKEY hKey = 0;
+    DWORD dwType = REG_SZ;
+    char buf[255] = {0};
+    DWORD dwBufSize = sizeof(buf)-1;
+
+    status = RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+                          TEXT("SOFTWARE\\Microsoft\\Cryptography"),
+                          0,
+                          KEY_QUERY_VALUE,
+                          &hKey);
+
+    if (status != ERROR_SUCCESS) {
+        return -1;
+    }
+
+    status = RegQueryValueEx(hKey, TEXT("MachineGuid"), 0, &dwType, (LPBYTE)buf, &dwBufSize );
+    RegCloseKey(hKey);
+
+    if (status == ERROR_SUCCESS) {
+        *out_id = flb_calloc(1, dwBufSize+1);
+
+        if (*out_id == NULL) {
+            return -1;
+        }
+
+        *out_size = dwBufSize;
         return 0;
     }
 #endif
@@ -1276,4 +1434,30 @@ int flb_utils_get_machine_id(char **out_id, size_t *out_size)
     }
 
     return -1;
+}
+
+void flb_utils_set_plugin_string_property(const char *name,
+                                          flb_sds_t *field_storage,
+                                          flb_sds_t  new_value)
+{
+    if (field_storage == NULL) {
+        flb_error("[utils] invalid field storage pointer for property '%s'",
+                  name);
+
+        return;
+    }
+
+    if (*field_storage != NULL) {
+        flb_warn("[utils] property '%s' is already specified with value '%s'."
+                 " Overwriting with '%s'",
+                 name,
+                 *field_storage,
+                 new_value);
+
+        flb_sds_destroy(*field_storage);
+
+        *field_storage = NULL;
+    }
+
+    *field_storage = new_value;
 }

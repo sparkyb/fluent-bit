@@ -115,9 +115,8 @@ static inline int process_line(const char *line,
     uint64_t val;
     const char *p = line;
     char *end = NULL;
-    msgpack_packer mp_pck;
-    msgpack_sbuffer mp_sbuf;
     struct flb_time ts;
+    int ret;
 
     /* Increase buffer position */
     ctx->buffer_id++;
@@ -131,6 +130,11 @@ static inline int process_line(const char *line,
 
     /* Priority */
     priority = FLB_KLOG_PRI(val);
+
+    if (priority > ctx->prio_level) {
+        /* Drop line */
+        return 0;
+    }
 
     /* Sequence */
     p = strchr(p, ',');
@@ -169,41 +173,51 @@ static inline int process_line(const char *line,
 
     line_len = strlen(p);
 
-    /* Initialize local msgpack buffer */
-    msgpack_sbuffer_init(&mp_sbuf);
-    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
+    ret = flb_log_event_encoder_begin_record(&ctx->log_encoder);
 
-    /*
-     * Store the new data into the MessagePack buffer,
-     * we handle this as a list of maps.
-     */
-    msgpack_pack_array(&mp_pck, 2);
-    flb_time_append_to_msgpack(&ts, &mp_pck, 0);
+    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+        ret = flb_log_event_encoder_set_timestamp(
+                &ctx->log_encoder,
+                &ts);
+    }
 
-    msgpack_pack_map(&mp_pck, 5);
-    msgpack_pack_str(&mp_pck, 8);
-    msgpack_pack_str_body(&mp_pck, "priority", 8);
-    msgpack_pack_char(&mp_pck, priority);
+    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+        ret = flb_log_event_encoder_append_body_values(
+                &ctx->log_encoder,
+                FLB_LOG_EVENT_CSTRING_VALUE("priority"),
+                FLB_LOG_EVENT_CHAR_VALUE(priority),
 
-    msgpack_pack_str(&mp_pck, 8);
-    msgpack_pack_str_body(&mp_pck, "sequence", 8);
-    msgpack_pack_uint64(&mp_pck, sequence);
+                FLB_LOG_EVENT_CSTRING_VALUE("sequence"),
+                FLB_LOG_EVENT_UINT64_VALUE(sequence),
 
-    msgpack_pack_str(&mp_pck, 3);
-    msgpack_pack_str_body(&mp_pck, "sec", 3);
-    msgpack_pack_uint64(&mp_pck, tv.tv_sec);
+                FLB_LOG_EVENT_CSTRING_VALUE("sec"),
+                FLB_LOG_EVENT_UINT64_VALUE(tv.tv_sec),
 
-    msgpack_pack_str(&mp_pck, 4);
-    msgpack_pack_str_body(&mp_pck, "usec", 4);
-    msgpack_pack_uint64(&mp_pck, tv.tv_usec);
+                FLB_LOG_EVENT_CSTRING_VALUE("usec"),
+                FLB_LOG_EVENT_UINT64_VALUE(tv.tv_usec),
 
-    msgpack_pack_str(&mp_pck, 3);
-    msgpack_pack_str_body(&mp_pck, "msg", 3);
-    msgpack_pack_str(&mp_pck, line_len - 1);
-    msgpack_pack_str_body(&mp_pck, p, line_len - 1);
+                FLB_LOG_EVENT_CSTRING_VALUE("msg"),
+                FLB_LOG_EVENT_STRING_VALUE((char *) p, line_len - 1));
+    }
 
-    flb_input_chunk_append_raw(i_ins, NULL, 0, mp_sbuf.data, mp_sbuf.size);
-    msgpack_sbuffer_destroy(&mp_sbuf);
+    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+        ret = flb_log_event_encoder_commit_record(&ctx->log_encoder);
+    }
+
+    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+        flb_input_log_append(ctx->ins, NULL, 0,
+                             ctx->log_encoder.output_buffer,
+                             ctx->log_encoder.output_length);
+
+        ret = 0;
+    }
+    else {
+        flb_plg_error(ctx->ins, "Error encoding record : %d", ret);
+
+        ret = -1;
+    }
+
+    flb_log_event_encoder_reset(&ctx->log_encoder);
 
     flb_plg_debug(ctx->ins, "pri=%i seq=%" PRIu64 " sec=%ld usec=%ld msg_length=%i",
                   priority,
@@ -211,7 +225,7 @@ static inline int process_line(const char *line,
                   (long int) tv.tv_sec,
                   (long int) tv.tv_usec,
                   line_len - 1);
-    return 0;
+    return ret;
 
  fail:
     ctx->buffer_id--;
@@ -308,6 +322,7 @@ static int in_kmsg_init(struct flb_input_instance *ins,
         flb_free(ctx);
         return -1;
     }
+    flb_plg_debug(ctx->ins, "prio_level is %d", ctx->prio_level);
 
     /* Set our collector based on a file descriptor event */
     ret = flb_input_set_collector_event(ins,
@@ -321,6 +336,17 @@ static int in_kmsg_init(struct flb_input_instance *ins,
         return -1;
     }
 
+    ret = flb_log_event_encoder_init(&ctx->log_encoder,
+                                     FLB_LOG_EVENT_FORMAT_DEFAULT);
+
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_plg_error(ctx->ins, "error initializing event encoder : %d", ret);
+
+        flb_free(ctx);
+
+        return -1;
+    }
+
     return 0;
 }
 
@@ -328,6 +354,8 @@ static int in_kmsg_exit(void *data, struct flb_config *config)
 {
     (void)*config;
     struct flb_in_kmsg_config *ctx = data;
+
+    flb_log_event_encoder_destroy(&ctx->log_encoder);
 
     if (ctx->fd >= 0) {
         close(ctx->fd);
@@ -339,6 +367,12 @@ static int in_kmsg_exit(void *data, struct flb_config *config)
 }
 
 static struct flb_config_map config_map[] = {
+    {
+      FLB_CONFIG_MAP_INT, "prio_level", "8",
+      0, FLB_TRUE, offsetof(struct flb_in_kmsg_config, prio_level),
+      "The log level to filter. The kernel log is dropped if its priority is more than prio_level. "
+      "Allowed values are 0-8. Default is 8."
+    },
     /* EOF */
     {0}
 };

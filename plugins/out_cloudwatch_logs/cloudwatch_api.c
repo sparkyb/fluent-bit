@@ -27,6 +27,7 @@
 #include <fluent-bit/flb_macros.h>
 #include <fluent-bit/flb_config_map.h>
 #include <fluent-bit/flb_output_plugin.h>
+#include <fluent-bit/flb_log_event_decoder.h>
 
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_aws_credentials.h>
@@ -49,7 +50,7 @@
 #include "cloudwatch_api.h"
 
 #define ERR_CODE_ALREADY_EXISTS         "ResourceAlreadyExistsException"
-#define ERR_CODE_INVALID_SEQUENCE_TOKEN "InvalidSequenceTokenException"
+#define ERR_CODE_NOT_FOUND              "ResourceNotFoundException"
 
 #define AMZN_REQUEST_ID_HEADER          "x-amzn-RequestId"
 
@@ -207,7 +208,7 @@ static int init_put_payload(struct flb_cloudwatch *ctx, struct cw_flush *buf,
     }
 
     if (!try_to_write(buf->out_buf, offset, buf->out_buf_size,
-                      ctx->log_group, 0)) {
+                      stream->group, 0)) {
         goto error;
     }
 
@@ -224,23 +225,6 @@ static int init_put_payload(struct flb_cloudwatch *ctx, struct cw_flush *buf,
     if (!try_to_write(buf->out_buf, offset, buf->out_buf_size,
                       "\",", 2)) {
         goto error;
-    }
-
-    if (stream->sequence_token) {
-        if (!try_to_write(buf->out_buf, offset, buf->out_buf_size,
-                          "\"sequenceToken\":\"", 17)) {
-            goto error;
-        }
-
-        if (!try_to_write(buf->out_buf, offset, buf->out_buf_size,
-                          stream->sequence_token, 0)) {
-            goto error;
-        }
-
-        if (!try_to_write(buf->out_buf, offset, buf->out_buf_size,
-                          "\",", 2)) {
-            goto error;
-        }
     }
 
     if (!try_to_write(buf->out_buf, offset, buf->out_buf_size,
@@ -482,22 +466,19 @@ int process_event(struct flb_cloudwatch *ctx, struct cw_flush *buf,
 }
 
 /* Resets or inits a cw_flush struct */
-void reset_flush_buf(struct flb_cloudwatch *ctx, struct cw_flush *buf,
-                    struct log_stream *stream) {
+void reset_flush_buf(struct flb_cloudwatch *ctx, struct cw_flush *buf) {
     buf->event_index = 0;
     buf->tmp_buf_offset = 0;
     buf->event_index = 0;
     buf->data_size = PUT_LOG_EVENTS_HEADER_LEN + PUT_LOG_EVENTS_FOOTER_LEN;
-    buf->data_size += strlen(stream->name);
-    buf->data_size += strlen(ctx->log_group);
-    if (stream->sequence_token) {
-        buf->data_size += strlen(stream->sequence_token);
+    if (buf->current_stream != NULL) {
+        buf->data_size += strlen(buf->current_stream->name);
+        buf->data_size += strlen(buf->current_stream->group);
     }
 }
 
 /* sorts events, constructs a put payload, and then sends */
-int send_log_events(struct flb_cloudwatch *ctx, struct cw_flush *buf,
-                    struct log_stream *stream) {
+int send_log_events(struct flb_cloudwatch *ctx, struct cw_flush *buf) {
     int ret;
     int offset;
     int i;
@@ -511,11 +492,11 @@ int send_log_events(struct flb_cloudwatch *ctx, struct cw_flush *buf,
     qsort(buf->events, buf->event_index, sizeof(struct cw_event), compare_events);
 
 retry:
-    stream->newest_event = 0;
-    stream->oldest_event = 0;
+    buf->current_stream->newest_event = 0;
+    buf->current_stream->oldest_event = 0;
 
     offset = 0;
-    ret = init_put_payload(ctx, buf, stream, &offset);
+    ret = init_put_payload(ctx, buf, buf->current_stream, &offset);
     if (ret < 0) {
         flb_plg_error(ctx->ins, "Failed to initialize PutLogEvents payload");
         return -1;
@@ -544,8 +525,8 @@ retry:
         return -1;
     }
 
-    flb_plg_debug(ctx->ins, "Sending %d events", i);
-    ret = put_log_events(ctx, buf, stream, (size_t) offset);
+    flb_plg_debug(ctx->ins, "cloudwatch:PutLogEvents: events=%d, payload=%d bytes", i, offset);
+    ret = put_log_events(ctx, buf, buf->current_stream, (size_t) offset);
     if (ret < 0) {
         flb_plg_error(ctx->ins, "Failed to send log events");
         return -1;
@@ -557,9 +538,14 @@ retry:
     return 0;
 }
 
-/*
- * Processes the msgpack object, sends the current batch if needed
- */
+ /*
+  * Processes the msgpack object, sends the current batch if needed
+  * -1 = failure, event not added
+  * 0 = success, event added
+  * 1 = event been skipped
+  * Returns 0 on success, -1 on general errors,
+  * and 1 if we found a empty event or a large event.
+  */
 int add_event(struct flb_cloudwatch *ctx, struct cw_flush *buf,
               struct log_stream *stream,
               const msgpack_object *obj, struct flb_time *tms)
@@ -569,13 +555,20 @@ int add_event(struct flb_cloudwatch *ctx, struct cw_flush *buf,
     int retry_add = FLB_FALSE;
     int event_bytes = 0;
 
-    if (buf->event_index == 0) {
-        /* init */
-        reset_flush_buf(ctx, buf, stream);
+    if (buf->event_index > 0 && buf->current_stream != stream) {
+        /* we already have events for a different stream, send them first */
+        retry_add = FLB_TRUE;
+        goto send;
     }
 
 retry_add_event:
+    buf->current_stream = stream;
     retry_add = FLB_FALSE;
+    if (buf->event_index == 0) {
+        /* init */
+        reset_flush_buf(ctx, buf);
+    }
+
     ret = process_event(ctx, buf, obj, tms);
     if (ret < 0) {
         return -1;
@@ -584,7 +577,7 @@ retry_add_event:
         if (buf->event_index <= 0) {
             /* somehow the record was larger than our entire request buffer */
             flb_plg_warn(ctx->ins, "Discarding massive log record");
-            return 0; /* discard this record and return to caller */
+            return 1; /* discard this record and return to caller */
         }
         /* send logs and then retry the add */
         retry_add = FLB_TRUE;
@@ -595,7 +588,7 @@ retry_add_event:
          * discard this record and return to caller
          * only happens for empty records in this plugin
          */
-        return 0;
+        return 1;
     }
 
     event = &buf->events[buf->event_index];
@@ -630,8 +623,8 @@ retry_add_event:
     return 0;
 
 send:
-    ret = send_log_events(ctx, buf, stream);
-    reset_flush_buf(ctx, buf, stream);
+    ret = send_log_events(ctx, buf);
+    reset_flush_buf(ctx, buf);
     if (ret < 0) {
         return -1;
     }
@@ -791,20 +784,16 @@ int pack_emf_payload(struct flb_cloudwatch *ctx,
 }
 
 /*
- * Main routine- processes msgpack and sends in batches
- * return value is the number of events processed
+ * Main routine- processes msgpack and sends in batches which ignore the empty ones
+ * return value is the number of events processed and send.
  */
 int process_and_send(struct flb_cloudwatch *ctx, const char *input_plugin, 
-                     struct cw_flush *buf, struct log_stream *stream, 
+                     struct cw_flush *buf, flb_sds_t tag,
                      const char *data, size_t bytes)
 {
-    size_t off = 0;
     int i = 0;
     size_t map_size;
-    msgpack_unpacked result;
-    msgpack_object  *obj;
     msgpack_object  map;
-    msgpack_object root;
     msgpack_object_kv *kv;
     msgpack_object  key;
     msgpack_object  val;
@@ -813,13 +802,14 @@ int process_and_send(struct flb_cloudwatch *ctx, const char *input_plugin,
     /* msgpack::sbuffer is a simple buffer implementation. */
     msgpack_sbuffer mp_sbuf;
 
+    struct log_stream *stream;
+
     char *key_str = NULL;
     size_t key_str_size = 0;
     int j;
     int ret;
     int check = FLB_FALSE;
     int found = FLB_FALSE;
-    struct flb_time tms;
 
     /* Added for EMF support */
     struct flb_intermediate_metric *metric;
@@ -829,6 +819,18 @@ int process_and_send(struct flb_cloudwatch *ctx, const char *input_plugin,
 
     int intermediate_metric_type;
     char *intermediate_metric_unit;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
+
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
+
+        return -1;
+    }
+
     if (strncmp(input_plugin, "cpu", 3) == 0) {
         intermediate_metric_type = GAUGE;
         intermediate_metric_unit = PERCENT;
@@ -839,23 +841,19 @@ int process_and_send(struct flb_cloudwatch *ctx, const char *input_plugin,
     }
 
     /* unpack msgpack */
-    msgpack_unpacked_init(&result);
-    while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
-        /*
-         * Each record is a msgpack array [timestamp, map] of the
-         * timestamp and record map.
-         */
-        root = result.data;
-        if (root.via.array.size != 2) {
-            continue;
-        }
-
-        /* unpack the array of [timestamp, map] */
-        flb_time_pop_from_msgpack(&tms, &result, &obj);
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
 
         /* Get the record/map */
-        map = root.via.array.ptr[1];
+        map = *log_event.body;
         map_size = map.via.map.size;
+
+        stream = get_log_stream(ctx, tag, map);
+        if (!stream) {
+            flb_plg_debug(ctx->ins, "Couldn't determine log group & stream for record with tag %s", tag);
+            goto error;
+        }
 
         if (ctx->log_key) {
             key_str = NULL;
@@ -882,7 +880,8 @@ int process_and_send(struct flb_cloudwatch *ctx, const char *input_plugin,
                     if (strncmp(ctx->log_key, key_str, key_str_size) == 0) {
                         found = FLB_TRUE;
                         val = (kv+j)->val;
-                        ret = add_event(ctx, buf, stream, &val, &tms);
+                        ret = add_event(ctx, buf, stream, &val,
+                                        &log_event.timestamp);
                         if (ret < 0 ) {
                             goto error;
                         }
@@ -894,9 +893,11 @@ int process_and_send(struct flb_cloudwatch *ctx, const char *input_plugin,
                 flb_plg_error(ctx->ins, "Could not find log_key '%s' in record",
                               ctx->log_key);
             }
-            else {
+
+            if (ret == 0) {
                 i++;
             }
+
             continue;
         }
 
@@ -913,7 +914,7 @@ int process_and_send(struct flb_cloudwatch *ctx, const char *input_plugin,
              * and add to the list.
              */
             for (i = 0; i < map_size; i++) {
-                metric = flb_malloc(sizeof(struct flb_intermediate_metric));
+                metric = flb_calloc(1, sizeof(struct flb_intermediate_metric));
                 if (!metric) {
                     goto error;
                 }
@@ -922,7 +923,7 @@ int process_and_send(struct flb_cloudwatch *ctx, const char *input_plugin,
                 metric->value = (kv + i)->val;
                 metric->metric_type = intermediate_metric_type;
                 metric->metric_unit = intermediate_metric_unit;
-                metric->timestamp = tms;
+                metric->timestamp = log_event.timestamp;
 
                 mk_list_add(&metric->_head, &flb_intermediate_metrics);
                 
@@ -937,7 +938,7 @@ int process_and_send(struct flb_cloudwatch *ctx, const char *input_plugin,
             ret = pack_emf_payload(ctx,
                                     &flb_intermediate_metrics,
                                     input_plugin,
-                                    tms,
+                                    log_event.timestamp,
                                     &mp_sbuf,
                                     &mp_emf_result,
                                     &emf_payload);
@@ -956,25 +957,30 @@ int process_and_send(struct flb_cloudwatch *ctx, const char *input_plugin,
                 msgpack_sbuffer_destroy(&mp_sbuf);
                 goto error;
             }
-            ret = add_event(ctx, buf, stream, &emf_payload, &tms);
+            ret = add_event(ctx, buf, stream, &emf_payload,
+                            &log_event.timestamp);
 
             msgpack_unpacked_destroy(&mp_emf_result);
             msgpack_sbuffer_destroy(&mp_sbuf);
 
         } else {
-            ret = add_event(ctx, buf, stream, &map, &tms);
+            ret = add_event(ctx, buf, stream, &map,
+                            &log_event.timestamp);
         }
 
         if (ret < 0 ) {
             goto error;
         }
-        i++;
+
+        if (ret == 0) {
+            i++;
+        }
     }
-    msgpack_unpacked_destroy(&result);
+    flb_log_event_decoder_destroy(&log_decoder);
 
     /* send any remaining events */
-    ret = send_log_events(ctx, buf, stream);
-    reset_flush_buf(ctx, buf, stream);
+    ret = send_log_events(ctx, buf);
+    reset_flush_buf(ctx, buf);
     if (ret < 0) {
         return -1;
     }
@@ -983,43 +989,27 @@ int process_and_send(struct flb_cloudwatch *ctx, const char *input_plugin,
     return i;
 
 error:
-    msgpack_unpacked_destroy(&result);
+    flb_log_event_decoder_destroy(&log_decoder);
+
     return -1;
 }
 
-
-struct log_stream *get_dynamic_log_stream(struct flb_cloudwatch *ctx,
-                                          const char *tag, int tag_len)
+struct log_stream *get_or_create_log_stream(struct flb_cloudwatch *ctx,
+                                            flb_sds_t stream_name,
+                                            flb_sds_t group_name)
 {
     int ret;
     struct log_stream *new_stream;
     struct log_stream *stream;
     struct mk_list *tmp;
     struct mk_list *head;
-    flb_sds_t name = NULL;
-    flb_sds_t tmp_s = NULL;
     time_t now;
-
-    name = flb_sds_create(ctx->log_stream_prefix);
-    if (!name) {
-        flb_errno();
-        return NULL;
-    }
-
-    tmp_s = flb_sds_cat(name, tag, tag_len);
-    if (!tmp_s) {
-        flb_errno();
-        flb_sds_destroy(name);
-        return NULL;
-    }
-    name = tmp_s;
 
     /* check if the stream already exists */
     now = time(NULL);
     mk_list_foreach_safe(head, tmp, &ctx->streams) {
         stream = mk_list_entry(head, struct log_stream, _head);
-        if (strcmp(name, stream->name) == 0) {
-            flb_sds_destroy(name);
+        if (strcmp(stream_name, stream->name) == 0 && strcmp(group_name, stream->group) == 0) {
             return stream;
         }
         else {
@@ -1035,12 +1025,20 @@ struct log_stream *get_dynamic_log_stream(struct flb_cloudwatch *ctx,
     new_stream = flb_calloc(1, sizeof(struct log_stream));
     if (!new_stream) {
         flb_errno();
-        flb_sds_destroy(name);
         return NULL;
     }
-    new_stream->name = name;
+    new_stream->name = flb_sds_create(stream_name);
+    if (new_stream->name == NULL) {
+        flb_errno();
+        return NULL;
+    }
+    new_stream->group = flb_sds_create(group_name);
+    if (new_stream->group == NULL) {
+        flb_errno();
+        return NULL;
+    }
 
-    ret = create_log_stream(ctx, new_stream);
+    ret = create_log_stream(ctx, new_stream, FLB_TRUE);
     if (ret < 0) {
         log_stream_destroy(new_stream);
         return NULL;
@@ -1051,29 +1049,78 @@ struct log_stream *get_dynamic_log_stream(struct flb_cloudwatch *ctx,
     return new_stream;
 }
 
-struct log_stream *get_log_stream(struct flb_cloudwatch *ctx,
-                                  const char *tag, int tag_len)
+struct log_stream *get_log_stream(struct flb_cloudwatch *ctx, flb_sds_t tag,
+                                  const msgpack_object map)
 {
+    flb_sds_t group_name = NULL;
+    flb_sds_t stream_name = NULL;
+    flb_sds_t tmp_s = NULL;
+    int free_group = FLB_FALSE;
+    int free_stream = FLB_FALSE;
     struct log_stream *stream;
-    int ret;
 
-    if (ctx->log_stream_name) {
-        stream = &ctx->stream;
-        if (ctx->stream_created == FLB_FALSE) {
-            ret = create_log_stream(ctx, stream);
-            if (ret < 0) {
-                return NULL;
-            }
-            stream->expiration = time(NULL) + FOUR_HOURS_IN_SECONDS;
-            ctx->stream_created = FLB_TRUE;
-        }
-        return stream;
+    /* templates take priority */
+    if (ctx->ra_stream) {
+        stream_name = flb_ra_translate_check(ctx->ra_stream, tag, flb_sds_len(tag),
+                                             map, NULL, FLB_TRUE);
     }
 
-     return get_dynamic_log_stream(ctx, tag, tag_len);
+    if (ctx->ra_group) {
+        group_name = flb_ra_translate_check(ctx->ra_group, tag, flb_sds_len(tag),
+                                            map, NULL, FLB_TRUE);
+    }
+    
+    if (stream_name == NULL) {
+        if (ctx->stream_name) {
+            stream_name = ctx->stream_name;
+        } else {
+            free_stream = FLB_TRUE;
+            /* use log_stream_prefix */
+            stream_name = flb_sds_create(ctx->log_stream_prefix);
+            if (!stream_name) {
+                flb_errno();
+                if (group_name) {
+                    flb_sds_destroy(group_name);
+                }
+                return NULL;
+            }
+
+            tmp_s = flb_sds_cat(stream_name, tag, flb_sds_len(tag));
+            if (!tmp_s) {
+                flb_errno();
+                flb_sds_destroy(stream_name);
+                if (group_name) {
+                    flb_sds_destroy(group_name);
+                }
+                return NULL;
+            }
+            stream_name = tmp_s;
+        }
+    } else {
+        free_stream = FLB_TRUE;
+    }
+    
+    if (group_name == NULL) {
+        group_name = ctx->group_name;
+    } else {
+        free_group = FLB_TRUE;
+    }
+
+    flb_plg_debug(ctx->ins, "Using stream=%s, group=%s", stream_name, group_name);
+
+    stream = get_or_create_log_stream(ctx, stream_name, group_name);
+
+    if (free_group == FLB_TRUE) {
+        flb_sds_destroy(group_name);
+    }
+    if (free_stream == FLB_TRUE) {
+        flb_sds_destroy(stream_name);
+    }
+    return stream;
 }
 
-static int set_log_group_retention(struct flb_cloudwatch *ctx)
+
+static int set_log_group_retention(struct flb_cloudwatch *ctx, struct log_stream *stream)
 {
     if (ctx->log_retention_days <= 0) {
         /* no need to set */
@@ -1084,11 +1131,10 @@ static int set_log_group_retention(struct flb_cloudwatch *ctx)
     struct flb_aws_client *cw_client;
     flb_sds_t body;
     flb_sds_t tmp;
-    flb_sds_t error;
 
-    flb_plg_info(ctx->ins, "Setting retention policy on log group %s to %dd", ctx->log_group, ctx->log_retention_days);
+    flb_plg_info(ctx->ins, "Setting retention policy on log group %s to %dd", stream->group, ctx->log_retention_days);
 
-    body = flb_sds_create_size(68 + strlen(ctx->log_group));
+    body = flb_sds_create_size(68 + strlen(stream->group));
     if (!body) {
         flb_sds_destroy(body);
         flb_errno();
@@ -1096,7 +1142,7 @@ static int set_log_group_retention(struct flb_cloudwatch *ctx)
     }
 
     /* construct CreateLogGroup request body */
-    tmp = flb_sds_printf(&body, "{\"logGroupName\":\"%s\",\"retentionInDays\":%d}", ctx->log_group, ctx->log_retention_days);
+    tmp = flb_sds_printf(&body, "{\"logGroupName\":\"%s\",\"retentionInDays\":%d}", stream->group, ctx->log_retention_days);
     if (!tmp) {
         flb_sds_destroy(body);
         flb_errno();
@@ -1127,17 +1173,9 @@ static int set_log_group_retention(struct flb_cloudwatch *ctx)
 
         /* Check error */
         if (c->resp.payload_size > 0) {
-            error = flb_aws_error(c->resp.payload, c->resp.payload_size);
-            if (error != NULL) {
-                /* some other error occurred; notify user */
-                flb_aws_print_error(c->resp.payload, c->resp.payload_size,
-                                        "PutRetentionPolicy", ctx->ins);
-                flb_sds_destroy(error);
-            }
-            else {
-                /* error can not be parsed, print raw response to debug */
-                flb_plg_debug(ctx->ins, "Raw response: %s", c->resp.payload);
-            }
+            /* some error occurred; notify user */
+            flb_aws_print_error(c->resp.payload, c->resp.payload_size,
+                                               "PutRetentionPolicy", ctx->ins);
         }
     }
 
@@ -1150,7 +1188,7 @@ static int set_log_group_retention(struct flb_cloudwatch *ctx)
     return -1;
 }
 
-int create_log_group(struct flb_cloudwatch *ctx)
+int create_log_group(struct flb_cloudwatch *ctx, struct log_stream *stream)
 {
     struct flb_http_client *c = NULL;
     struct flb_aws_client *cw_client;
@@ -1159,9 +1197,9 @@ int create_log_group(struct flb_cloudwatch *ctx)
     flb_sds_t error;
     int ret;
 
-    flb_plg_info(ctx->ins, "Creating log group %s", ctx->log_group);
+    flb_plg_info(ctx->ins, "Creating log group %s", stream->group);
 
-    body = flb_sds_create_size(25 + strlen(ctx->log_group));
+    body = flb_sds_create_size(25 + strlen(stream->group));
     if (!body) {
         flb_sds_destroy(body);
         flb_errno();
@@ -1169,7 +1207,7 @@ int create_log_group(struct flb_cloudwatch *ctx)
     }
 
     /* construct CreateLogGroup request body */
-    tmp = flb_sds_printf(&body, "{\"logGroupName\":\"%s\"}", ctx->log_group);
+    tmp = flb_sds_printf(&body, "{\"logGroupName\":\"%s\"}", stream->group);
     if (!tmp) {
         flb_sds_destroy(body);
         flb_errno();
@@ -1192,11 +1230,10 @@ int create_log_group(struct flb_cloudwatch *ctx)
 
         if (c->resp.status == 200) {
             /* success */
-            flb_plg_info(ctx->ins, "Created log group %s", ctx->log_group);
-            ctx->group_created = FLB_TRUE;
+            flb_plg_info(ctx->ins, "Created log group %s", stream->group);
             flb_sds_destroy(body);
             flb_http_client_destroy(c);
-            ret = set_log_group_retention(ctx);
+            ret = set_log_group_retention(ctx, stream);
             return ret;
         }
 
@@ -1206,22 +1243,21 @@ int create_log_group(struct flb_cloudwatch *ctx)
             if (error != NULL) {
                 if (strcmp(error, ERR_CODE_ALREADY_EXISTS) == 0) {
                     flb_plg_info(ctx->ins, "Log Group %s already exists",
-                                  ctx->log_group);
-                    ctx->group_created = FLB_TRUE;
+                                 stream->group);
                     flb_sds_destroy(body);
                     flb_sds_destroy(error);
                     flb_http_client_destroy(c);
-                    ret = set_log_group_retention(ctx);
+                    ret = set_log_group_retention(ctx, stream);
                     return ret;
                 }
                 /* some other error occurred; notify user */
                 flb_aws_print_error(c->resp.payload, c->resp.payload_size,
-                                        "CreateLogGroup", ctx->ins);
+                                    "CreateLogGroup", ctx->ins);
                 flb_sds_destroy(error);
             }
             else {
-                /* error can not be parsed, print raw response to debug */
-                flb_plg_debug(ctx->ins, "Raw response: %s", c->resp.payload);
+                /* error can not be parsed, print raw response */
+                flb_plg_warn(ctx->ins, "Raw response: %s", c->resp.payload);
             }
         }
     }
@@ -1234,7 +1270,8 @@ int create_log_group(struct flb_cloudwatch *ctx)
     return -1;
 }
 
-int create_log_stream(struct flb_cloudwatch *ctx, struct log_stream *stream)
+int create_log_stream(struct flb_cloudwatch *ctx, struct log_stream *stream,
+                      int can_retry)
 {
 
     struct flb_http_client *c = NULL;
@@ -1242,11 +1279,12 @@ int create_log_stream(struct flb_cloudwatch *ctx, struct log_stream *stream)
     flb_sds_t body;
     flb_sds_t tmp;
     flb_sds_t error;
+    int ret;
 
     flb_plg_info(ctx->ins, "Creating log stream %s in log group %s",
-                 stream->name, ctx->log_group);
+                 stream->name, stream->group);
 
-    body = flb_sds_create_size(50 + strlen(ctx->log_group) +
+    body = flb_sds_create_size(50 + strlen(stream->group) +
                                strlen(stream->name));
     if (!body) {
         flb_sds_destroy(body);
@@ -1257,7 +1295,7 @@ int create_log_stream(struct flb_cloudwatch *ctx, struct log_stream *stream)
     /* construct CreateLogStream request body */
     tmp = flb_sds_printf(&body,
                          "{\"logGroupName\":\"%s\",\"logStreamName\":\"%s\"}",
-                         ctx->log_group,
+                         stream->group,
                          stream->name);
     if (!tmp) {
         flb_sds_destroy(body);
@@ -1300,14 +1338,41 @@ int create_log_stream(struct flb_cloudwatch *ctx, struct log_stream *stream)
                     flb_http_client_destroy(c);
                     return 0;
                 }
+
+                if (strcmp(error, ERR_CODE_NOT_FOUND) == 0) {
+                    flb_sds_destroy(body);
+                    flb_sds_destroy(error);
+                    flb_http_client_destroy(c);
+
+                    if (ctx->create_group == FLB_TRUE) {
+                        flb_plg_info(ctx->ins, "Log Group %s not found. Will attempt to create it.",
+                                     stream->group);
+                        ret = create_log_group(ctx, stream);
+                        if (ret < 0) {
+                            return -1;
+                        } else {
+                            if (can_retry == FLB_TRUE) {
+                                /* retry stream creation */
+                                return create_log_stream(ctx, stream, FLB_FALSE);
+                            } else {
+                                /* we failed to create the stream */
+                                return -1;
+                            }
+                        }
+                    } else {
+                        flb_plg_error(ctx->ins, "Log Group %s not found and `auto_create_group` disabled.",
+                                      stream->group);
+                    }
+                    return -1;
+                }
                 /* some other error occurred; notify user */
                 flb_aws_print_error(c->resp.payload, c->resp.payload_size,
                                     "CreateLogStream", ctx->ins);
                 flb_sds_destroy(error);
             }
             else {
-                /* error can not be parsed, print raw response to debug */
-                flb_plg_debug(ctx->ins, "Raw response: %s", c->resp.payload);
+                /* error can not be parsed, print raw response */
+                flb_plg_warn(ctx->ins, "Raw response: %s", c->resp.payload);
             }
         }
     }
@@ -1321,8 +1386,7 @@ int create_log_stream(struct flb_cloudwatch *ctx, struct log_stream *stream)
 }
 
 /*
- * Returns -1 on failure, 0 on success, and 1 for a sequence token error,
- * which means the caller can retry.
+ * Returns -1 on failure, 0 on success
  */
 int put_log_events(struct flb_cloudwatch *ctx, struct cw_flush *buf,
                    struct log_stream *stream, size_t payload_size)
@@ -1331,20 +1395,8 @@ int put_log_events(struct flb_cloudwatch *ctx, struct cw_flush *buf,
     struct flb_http_client *c = NULL;
     struct flb_aws_client *cw_client;
     flb_sds_t tmp;
-    flb_sds_t error;
     int num_headers = 1;
     int retry = FLB_TRUE;
-
-    buf->put_events_calls++;
-
-    if (buf->put_events_calls >= 4) {
-        /*
-         * In normal execution, even under high throughput, 4+ calls per flush
-         * should be extremely rare. This is needed for edge cases basically.
-         */
-        flb_plg_debug(ctx->ins, "Too many calls this flush, sleeping for 250 ms");
-        usleep(250000);
-    }
 
     flb_plg_debug(ctx->ins, "Sending log events to log stream %s", stream->name);
 
@@ -1375,8 +1427,7 @@ retry_request:
             if (c->resp.data == NULL || c->resp.data_len == 0 || strstr(c->resp.data, AMZN_REQUEST_ID_HEADER) == NULL) {
                 /* code was 200, but response is invalid, treat as failure */
                 if (c->resp.data != NULL) {
-                    flb_plg_debug(ctx->ins, "Could not find sequence token in "
-                                  "response: response body is empty: full data: `%.*s`", c->resp.data_len, c->resp.data);
+                    flb_plg_debug(ctx->ins, "Invalid response: full data: `%.*s`", c->resp.data_len, c->resp.data);
                 }
                 flb_http_client_destroy(c);
 
@@ -1389,27 +1440,6 @@ retry_request:
                                   AMZN_REQUEST_ID_HEADER);
                 return -1;
             }
-
-
-            /* success */
-            if (c->resp.payload_size > 0) {
-                flb_plg_debug(ctx->ins, "Sent events to %s", stream->name);
-                tmp = flb_json_get_val(c->resp.payload, c->resp.payload_size,
-                                       "nextSequenceToken");
-                if (tmp) {
-                    if (stream->sequence_token != NULL) {
-                        flb_sds_destroy(stream->sequence_token);
-                    }
-                    stream->sequence_token = tmp;
-
-                    flb_http_client_destroy(c);
-                    return 0;
-                }
-                else {
-                    flb_plg_error(ctx->ins, "Could not find sequence token in "
-                                  "response: %s", c->resp.payload);
-                }
-            }
         
             flb_http_client_destroy(c);
             return 0;
@@ -1417,38 +1447,8 @@ retry_request:
 
         /* Check error */
         if (c->resp.payload_size > 0) {
-            error = flb_aws_error(c->resp.payload, c->resp.payload_size);
-            if (error != NULL) {
-                if (strcmp(error, ERR_CODE_INVALID_SEQUENCE_TOKEN) == 0) {
-                    /*
-                     * This case will happen when we do not know the correct
-                     * sequence token; we can find it in the error response
-                     * and retry.
-                     */
-                    flb_plg_debug(ctx->ins, "Sequence token was invalid, "
-                                  "will retry");
-                    tmp = flb_json_get_val(c->resp.payload, c->resp.payload_size,
-                                           "expectedSequenceToken");
-                    if (tmp) {
-                        if (stream->sequence_token != NULL) {
-                            flb_sds_destroy(stream->sequence_token);
-                        }
-                        stream->sequence_token = tmp;
-                        flb_sds_destroy(error);
-                        flb_http_client_destroy(c);
-                        /* tell the caller to retry */
-                        return 1;
-                    }
-                }
-                /* some other error occurred; notify user */
-                flb_aws_print_error(c->resp.payload, c->resp.payload_size,
-                                    "PutLogEvents", ctx->ins);
-                flb_sds_destroy(error);
-            }
-            else {
-                /* error could not be parsed, print raw response to debug */
-                flb_plg_debug(ctx->ins, "Raw response: %s", c->resp.payload);
-            }
+            flb_aws_print_error(c->resp.payload, c->resp.payload_size,
+                                                  "PutLogEvents", ctx->ins);
         }
     }
 

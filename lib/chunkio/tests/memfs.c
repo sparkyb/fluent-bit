@@ -49,7 +49,7 @@ static int read_file(const char *file, char *buf, size_t size)
 {
     char *p = buf;
     size_t total = 0;
-    size_t nb;
+    ssize_t nb;
 
     int fd = open(file, O_RDONLY);
     if (fd == -1)
@@ -86,14 +86,21 @@ static void test_memfs_write()
     struct cio_stream *stream;
     struct cio_chunk *chunk;
     struct cio_chunk **carr;
+    struct cio_options cio_opts;
 
     /* Dummy break line for clarity on acutest output */
     printf("\n");
 
     flags = CIO_CHECKSUM;
 
+    cio_options_init(&cio_opts);
+    cio_opts.flags = flags;
+
+    cio_opts.log_cb = log_cb;
+    cio_opts.flags = flags;
+
     /* Create main context */
-    ctx = cio_create(NULL, log_cb, CIO_LOG_INFO, flags);
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
 
     /* Try to create a file with an invalid stream */

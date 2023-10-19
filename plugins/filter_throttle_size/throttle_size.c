@@ -25,6 +25,8 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_log.h>
 #include <fluent-bit/flb_time.h>
+#include <fluent-bit/flb_log_event_decoder.h>
+#include <fluent-bit/flb_log_event_encoder.h>
 #include <msgpack.h>
 #include "stdlib.h"
 #include <stdio.h>
@@ -81,7 +83,7 @@ inline static void add_new_pane_to_each(struct throttle_size_table *ht,
                                         double timestamp)
 {
     struct mk_list *head;
-    struct flb_hash_entry *entry;
+    struct flb_hash_table_entry *entry;
     struct throttle_size_window *current_window;
     struct flb_time ftm;
 
@@ -91,7 +93,7 @@ inline static void add_new_pane_to_each(struct throttle_size_table *ht,
     }
 
     mk_list_foreach(head, &ht->windows->entries) {
-        entry = mk_list_entry(head, struct flb_hash_entry, _head_parent);
+        entry = mk_list_entry(head, struct flb_hash_table_entry, _head_parent);
         current_window = (struct throttle_size_window *) (entry->val);
         add_new_pane(current_window, timestamp);
         flb_debug
@@ -109,8 +111,8 @@ inline static void delete_older_than_n_seconds(struct throttle_size_table *ht,
     int i;
     struct mk_list *tmp;
     struct mk_list *head;
-    struct flb_hash_entry *entry;
-    struct flb_hash_table *table;
+    struct flb_hash_table_entry *entry;
+    struct flb_hash_table_chain *table;
     struct throttle_size_window *current_window;
     struct flb_time ftm;
     long time_treshold;
@@ -124,7 +126,7 @@ inline static void delete_older_than_n_seconds(struct throttle_size_table *ht,
     for (i = 0; i < ht->windows->size; i++) {
         table = &ht->windows->table[i];
         mk_list_foreach_safe(head, tmp, &table->chains) {
-            entry = mk_list_entry(head, struct flb_hash_entry, _head);
+            entry = mk_list_entry(head, struct flb_hash_table_entry, _head);
             current_window = (struct throttle_size_window *) entry->val;
 
             if (time_treshold > current_window->timestamp) {
@@ -149,11 +151,11 @@ inline static void delete_older_than_n_seconds(struct throttle_size_table *ht,
 inline static void print_all(struct throttle_size_table *ht)
 {
     struct mk_list *head;
-    struct flb_hash_entry *entry;
+    struct flb_hash_table_entry *entry;
     struct throttle_size_window *current_window;
 
     mk_list_foreach(head, &ht->windows->entries) {
-        entry = mk_list_entry(head, struct flb_hash_entry, _head_parent);
+        entry = mk_list_entry(head, struct flb_hash_table_entry, _head_parent);
         current_window = (struct throttle_size_window *) entry->val;
         printf("[%s] Name %s\n", PLUGIN_NAME, current_window->name);
         printf("[%s] Timestamp %ld\n", PLUGIN_NAME,
@@ -658,71 +660,79 @@ static int cb_throttle_size_filter(const void *data, size_t bytes,
                                    const char *tag, int tag_len,
                                    void **out_buf, size_t * out_size,
                                    struct flb_filter_instance *ins,
+                                   struct flb_input_instance *i_ins,
                                    void *context, struct flb_config *config)
 {
     int ret;
     int old_size = 0;
     int new_size = 0;
-    msgpack_unpacked result;
-    msgpack_object root;
-    msgpack_object map;
-    size_t off = 0;
+    struct flb_log_event_encoder log_encoder;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+
     (void) ins;
+    (void) i_ins;
     (void) config;
-    msgpack_sbuffer tmp_sbuf;
-    msgpack_packer tmp_pck;
 
-    /* Create temporal msgpack buffer */
-    msgpack_sbuffer_init(&tmp_sbuf);
-    msgpack_packer_init(&tmp_pck, &tmp_sbuf, msgpack_sbuffer_write);
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
 
-    /*
-     * Records come in the format,
-     *
-     * [ TIMESTAMP, { K1:V1, K2:V2, ...} ],
-     * [ TIMESTAMP, { K1:V1, K2:V2, ...} ]
-     *
-     * Example record:
-     *
-     *   [1123123, {"Mem.total"=>4050908, "Mem.used"=>476576, "Mem.free"=>3574332 } ]
-     */
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ins,
+                      "Log event decoder initialization error : %d", ret);
 
-    /* Iterate each item array and apply rules */
-    msgpack_unpacked_init(&result);
-    while (msgpack_unpack_next(&result, (const char *)data, bytes, &off)) {
-        root = result.data;
-        if (root.type != MSGPACK_OBJECT_ARRAY) {
-            continue;
-        }
+        return FLB_FILTER_NOTOUCH;
+    }
 
+    ret = flb_log_event_encoder_init(&log_encoder,
+                                     FLB_LOG_EVENT_FORMAT_DEFAULT);
+
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_plg_error(ins,
+                      "Log event encoder initialization error : %d", ret);
+
+        flb_log_event_decoder_destroy(&log_decoder);
+
+        return FLB_FILTER_NOTOUCH;
+    }
+
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
         old_size++;
 
-        /* get time and map */
-        map = root.via.array.ptr[1];
+        ret = throttle_data_by_size(*log_event.body, context);
 
-        ret = throttle_data_by_size(map, context);
         if (ret == throttle_size_RET_KEEP) {
-            msgpack_pack_object(&tmp_pck, root);
+            ret = flb_log_event_encoder_emit_raw_record(
+                             &log_encoder,
+                             log_decoder.record_base,
+                             log_decoder.record_length);
+
             new_size++;
         }
         else if (ret == throttle_size_RET_DROP) {
             /* Do nothing */
         }
     }
-    msgpack_unpacked_destroy(&result);
 
     /* we keep everything ? */
     if (old_size == new_size) {
         /* Destroy the buffer to avoid more overhead */
-        msgpack_sbuffer_destroy(&tmp_sbuf);
-        return FLB_FILTER_NOTOUCH;
+        ret = FLB_FILTER_NOTOUCH;
+    }
+    else {
+        *out_buf  = log_encoder.output_buffer;
+        *out_size = log_encoder.output_length;
+
+        flb_log_event_encoder_claim_internal_buffer_ownership(&log_encoder);
+
+        ret = FLB_FILTER_MODIFIED;
     }
 
-    /* link new buffers */
-    *out_buf = tmp_sbuf.data;
-    *out_size = tmp_sbuf.size;
+    flb_log_event_decoder_destroy(&log_decoder);
+    flb_log_event_encoder_destroy(&log_encoder);
 
-    return FLB_FILTER_MODIFIED;
+    return ret;
 }
 
 static void delete_field_key(struct mk_list *head)

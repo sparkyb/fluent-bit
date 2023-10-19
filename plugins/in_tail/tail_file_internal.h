@@ -24,6 +24,7 @@
 #include <fluent-bit/flb_input.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_time.h>
+#include <fluent-bit/flb_log_event_encoder.h>
 
 #ifdef FLB_HAVE_PARSER
 #include <fluent-bit/multiline/flb_ml.h>
@@ -46,7 +47,9 @@ struct flb_tail_file {
     int   is_link;
     char *name;                 /* target file name given by scan routine */
     char *real_name;            /* real file name in the file system */
+    char *orig_name;            /* original file name (before rotation) */
     size_t name_len;
+    size_t orig_name_len;
     time_t rotated;
     int64_t pending_bytes;
 
@@ -54,30 +57,29 @@ struct flb_tail_file {
     int tag_len;
     char *tag_buf;
 
-    /* multiline status */
+    /* OLD multiline */
     time_t mult_flush_timeout;  /* time when multiline started           */
     int mult_firstline;         /* bool: mult firstline found ?          */
     int mult_firstline_append;  /* bool: mult firstline appendable ?     */
     int mult_skipping;          /* skipping because ignode_older than ?  */
     int mult_keys;              /* total number of buffered keys         */
 
-
     int mult_records;           /* multiline records counter mult_sbuf   */
     msgpack_sbuffer mult_sbuf;  /* temporary msgpack buffer              */
     msgpack_packer mult_pck;    /* temporary msgpack packer              */
     struct flb_time mult_time;  /* multiline time parsed from first line */
 
-    /* docker mode */
+    /* OLD docker mode */
     time_t dmode_flush_timeout; /* time when docker mode started         */
     flb_sds_t dmode_buf;        /* buffer for docker mode                */
     flb_sds_t dmode_lastline;   /* last incomplete line                  */
     bool dmode_complete;        /* buffer contains completed log         */
     bool dmode_firstline;       /* dmode mult firstline found ?          */
 
-    /* multiline engine: file stream_id */
+    /* multiline engine: file stream_id and local buffers */
     uint64_t ml_stream_id;
 
-    /* buffering */
+    /* content parsing, positions and buffer */
     size_t parsed;
     size_t buf_len;
     size_t buf_size;
@@ -109,6 +111,15 @@ struct flb_tail_file {
 
     uint64_t hash_bits;
     flb_sds_t hash_key;
+
+    /* There are dedicated log event encoders for
+     * single and multi line events because I am respecting
+     * the old behavior which resulted in grouping both types
+     * of logs in tail_file.c but I don't know if this is
+     * strictly necessary.
+     */
+    struct flb_log_event_encoder *ml_log_event_encoder;
+    struct flb_log_event_encoder *sl_log_event_encoder;
 
     /* reference */
     int tail_mode;

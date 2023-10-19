@@ -19,6 +19,7 @@
 
 #include <stdlib.h>
 #include <fluent-bit/flb_utils.h>
+#include <fluent-bit/flb_downstream.h>
 #include <fluent-bit/flb_input_plugin.h>
 
 #include "fw.h"
@@ -37,6 +38,25 @@ struct flb_in_fw_config *fw_config_init(struct flb_input_instance *i_ins)
         flb_errno();
         return NULL;
     }
+    config->coll_fd = -1;
+
+    config->log_encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+
+    if (config->log_encoder == NULL) {
+        flb_plg_error(i_ins, "could not initialize event encoder");
+        fw_config_destroy(config);
+
+        return NULL;
+    }
+
+    config->log_decoder = flb_log_event_decoder_create(NULL, 0);
+
+    if (config->log_decoder == NULL) {
+        flb_plg_error(i_ins, "could not initialize event decoder");
+        fw_config_destroy(config);
+
+        return NULL;
+    }
 
     ret = flb_input_config_map_set(i_ins, (void *)config);
     if (ret == -1) {
@@ -53,6 +73,12 @@ struct flb_in_fw_config *fw_config_init(struct flb_input_instance *i_ins)
         snprintf(tmp, sizeof(tmp) - 1, "%d", i_ins->host.port);
         config->tcp_port = flb_strdup(tmp);
     }
+    else {
+        /* Unix socket mode */
+        if (config->unix_perm_str) {
+            config->unix_perm = strtol(config->unix_perm_str, NULL, 8) & 07777;
+        }
+    }
 
     if (!config->unix_path) {
         flb_debug("[in_fw] Listen='%s' TCP_Port=%s",
@@ -63,12 +89,31 @@ struct flb_in_fw_config *fw_config_init(struct flb_input_instance *i_ins)
 
 int fw_config_destroy(struct flb_in_fw_config *config)
 {
+    if (config->log_encoder != NULL) {
+        flb_log_event_encoder_destroy(config->log_encoder);
+    }
+
+    if (config->log_decoder != NULL) {
+        flb_log_event_decoder_destroy(config->log_decoder);
+    }
+
+    if (config->coll_fd != -1) {
+        flb_input_collector_delete(config->coll_fd, config->ins);
+
+        config->coll_fd = -1;
+    }
+
+    if (config->downstream != NULL) {
+        flb_downstream_destroy(config->downstream);
+    }
+
     if (config->unix_path) {
         unlink(config->unix_path);
     }
     else {
         flb_free(config->tcp_port);
     }
+
     flb_free(config);
 
     return 0;

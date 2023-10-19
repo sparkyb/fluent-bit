@@ -23,7 +23,7 @@ endif()
 # Monkey Version
 set(MK_VERSION_MAJOR  1)
 set(MK_VERSION_MINOR  7)
-set(MK_VERSION_PATCH  0)
+set(MK_VERSION_PATCH  2)
 set(MK_VERSION_STR "${MK_VERSION_MAJOR}.${MK_VERSION_MINOR}.${MK_VERSION_PATCH}")
 
 # Output paths
@@ -50,6 +50,7 @@ option(MK_MBEDTLS_SHARED "Use mbedtls shared lib"       No)
 option(MK_VALGRIND       "Enable Valgrind support"      No)
 option(MK_FUZZ_MODE      "Enable HonggFuzz mode"        No)
 option(MK_HTTP2          "Enable HTTP Support (dev)"    No)
+option(MK_TESTS          "Enable Tests"                 No)
 
 # Plugins: what should be build ?, these options
 # will be processed later on the plugins/CMakeLists.txt file
@@ -259,12 +260,12 @@ endif()
 
 configure_file(
   "${PROJECT_SOURCE_DIR}/include/monkey/mk_info.h.in"
-  "${PROJECT_SOURCE_DIR}/include/monkey/mk_info.h"
+  "${PROJECT_BINARY_DIR}/include/monkey/mk_info.h"
   )
 
 configure_file(
   "${PROJECT_SOURCE_DIR}/include/monkey/mk_env.h.in"
-  "${PROJECT_SOURCE_DIR}/include/monkey/mk_env.h"
+  "${PROJECT_BINARY_DIR}/include/monkey/mk_env.h"
   )
 
 
@@ -275,6 +276,8 @@ include_directories(deps/flb_libco)
 include_directories(deps/regex)
 include_directories(include)
 include_directories(include/monkey/)
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/include/)
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/include/monkey/)
 
 if (CMAKE_SYSTEM_NAME MATCHES "Windows")
   include_directories(mk_core/deps/libevent/include)
@@ -321,4 +324,8 @@ add_subdirectory(api)
 
 if(MK_FUZZ_MODE)
   add_subdirectory(fuzz)
+endif()
+
+if(MK_TESTS)
+  add_subdirectory(test)
 endif()

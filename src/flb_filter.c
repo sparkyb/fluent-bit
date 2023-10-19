@@ -26,7 +26,12 @@
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_metrics.h>
+#include <fluent-bit/flb_utils.h>
 #include <chunkio/chunkio.h>
+
+#ifdef FLB_HAVE_CHUNK_TRACE
+#include <fluent-bit/flb_chunk_trace.h>
+#endif /* FLB_HAVE_CHUNK_TRACE */
 
 static inline int instance_id(struct flb_config *config)
 {
@@ -39,6 +44,23 @@ static inline int instance_id(struct flb_config *config)
     entry = mk_list_entry_last(&config->filters, struct flb_filter_instance,
                                _head);
     return (entry->id + 1);
+}
+
+static int is_active(struct mk_list *in_properties)
+{
+    struct mk_list *head;
+    struct flb_kv *kv;
+
+    mk_list_foreach(head, in_properties) {
+        kv = mk_list_entry(head, struct flb_kv, _head);
+        if (strcasecmp(kv->key, "active") == 0) {
+            /* Skip checking deactivation ... */
+            if (strcasecmp(kv->val, "FALSE") == 0 || strcmp(kv->val, "0") == 0) {
+                return FLB_FALSE;
+            }
+        }
+    }
+    return FLB_TRUE;
 }
 
 static inline int prop_key_check(const char *key, const char *kv, int k_len)
@@ -77,6 +99,12 @@ void flb_filter_do(struct flb_input_chunk *ic,
     ssize_t write_at;
     struct mk_list *head;
     struct flb_filter_instance *f_ins;
+    struct flb_input_instance *i_ins = ic->in;
+/* measure time between filters for chunk traces. */
+#ifdef FLB_HAVE_CHUNK_TRACE
+    struct flb_time tm_start;
+    struct flb_time tm_finish;
+#endif /* FLB_HAVE_CHUNK_TRACE */
 
     /* For the incoming Tag make sure to create a NULL terminated reference */
     ntag = flb_malloc(tag_len + 1);
@@ -93,7 +121,7 @@ void flb_filter_do(struct flb_input_chunk *ic,
 
 #ifdef FLB_HAVE_METRICS
     /* timestamp */
-    ts = cmt_time_now();
+    ts = cfl_time_now();
 
     /* Count number of incoming records */
     in_records = ic->added_records;
@@ -103,6 +131,9 @@ void flb_filter_do(struct flb_input_chunk *ic,
     /* Iterate filters */
     mk_list_foreach(head, &config->filters) {
         f_ins = mk_list_entry(head, struct flb_filter_instance, _head);
+        if (is_active(&f_ins->properties) == FLB_FALSE) {
+            continue;
+        }
         if (flb_router_match(ntag, tag_len, f_ins->match
 #ifdef FLB_HAVE_REGEX
         , f_ins->match_regex
@@ -119,6 +150,11 @@ void flb_filter_do(struct flb_input_chunk *ic,
             /* where to position the new content if modified ? */
             write_at = (content_size - work_size);
 
+#ifdef FLB_HAVE_CHUNK_TRACE
+            if (ic->trace) {
+                flb_time_get(&tm_start);
+            }
+#endif /* FLB_HAVE_CHUNK_TRACE */
             /* Invoke the filter callback */
             ret = f_ins->p->cb_filter(work_data,      /* msgpack buffer   */
                                       work_size,      /* msgpack size     */
@@ -126,11 +162,25 @@ void flb_filter_do(struct flb_input_chunk *ic,
                                       &out_buf,       /* new data         */
                                       &out_size,      /* new data size    */
                                       f_ins,          /* filter instance  */
+                                      i_ins,          /* input instance   */
                                       f_ins->context, /* filter priv data */
                                       config);
+#ifdef FLB_HAVE_CHUNK_TRACE
+            if (ic->trace) {
+                flb_time_get(&tm_finish);
+            }
+#endif /* FLB_HAVE_CHUNK_TRACE */
 
 #ifdef FLB_HAVE_METRICS
             name = (char *) flb_filter_name(f_ins);
+
+            cmt_counter_add(f_ins->cmt_records, ts, in_records,
+                    1, (char *[]) {name});
+            cmt_counter_add(f_ins->cmt_bytes, ts, content_size,
+                    1, (char *[]) {name});
+
+            flb_metrics_sum(FLB_METRIC_N_RECORDS, in_records, f_ins->metrics);
+            flb_metrics_sum(FLB_METRIC_N_BYTES, content_size, f_ins->metrics);
 #endif
 
             /* Override buffer just if it was modified */
@@ -139,6 +189,12 @@ void flb_filter_do(struct flb_input_chunk *ic,
                 if (out_size == 0) {
                     /* reset data content length */
                     flb_input_chunk_write_at(ic, write_at, "", 0);
+#ifdef FLB_HAVE_CHUNK_TRACE
+                    if (ic->trace) {
+                        flb_chunk_trace_filter(ic->trace, (void *)f_ins, &tm_start, &tm_finish, "", 0);
+                    }
+#endif /* FLB_HAVE_CHUNK_TRACE */
+
 
 #ifdef FLB_HAVE_METRICS
                     ic->total_records = pre_records;
@@ -193,6 +249,12 @@ void flb_filter_do(struct flb_input_chunk *ic,
                     continue;
                 }
 
+#ifdef FLB_HAVE_CHUNK_TRACE
+                if (ic->trace) {
+                    flb_chunk_trace_filter(ic->trace, (void *)f_ins, &tm_start, &tm_finish, out_buf, out_size);
+                }
+#endif /* FLB_HAVE_CHUNK_TRACE */
+
                 /* Point back the 'data' pointer to the new address */
                 ret = cio_chunk_get_content(ic->chunk,
                                             (char **) &work_data, &cur_size);
@@ -234,10 +296,10 @@ int flb_filter_set_property(struct flb_filter_instance *ins,
     else
 #endif
     if (prop_key_check("match", k, len) == 0) {
-        ins->match = tmp;
+        flb_utils_set_plugin_string_property("match", &ins->match, tmp);
     }
     else if (prop_key_check("alias", k, len) == 0 && tmp) {
-        ins->alias = tmp;
+        flb_utils_set_plugin_string_property("alias", &ins->alias, tmp);
     }
     else if (prop_key_check("log_level", k, len) == 0 && tmp) {
         ret = flb_log_get_level_str(tmp);
@@ -246,6 +308,14 @@ int flb_filter_set_property(struct flb_filter_instance *ins,
             return -1;
         }
         ins->log_level = ret;
+    }
+    else if (prop_key_check("log_suppress_interval", k, len) == 0 && tmp) {
+        ret = flb_utils_time_to_seconds(tmp);
+        flb_sds_destroy(tmp);
+        if (ret == -1) {
+            return -1;
+        }
+        ins->log_suppress_interval = ret;
     }
     else {
         /*
@@ -332,6 +402,17 @@ struct flb_filter_instance *flb_filter_new(struct flb_config *config,
     }
     instance->config = config;
 
+    /*
+     * Initialize event type, if not set, default to FLB_FILTER_LOGS. Note that a
+     * zero value means it's undefined.
+     */
+    if (plugin->event_type == 0) {
+        instance->event_type = FLB_FILTER_LOGS;
+    }
+    else {
+        instance->event_type = plugin->event_type;
+    }
+
     /* Get an ID */
     id =  instance_id(config);
 
@@ -348,6 +429,7 @@ struct flb_filter_instance *flb_filter_new(struct flb_config *config,
     instance->match_regex = NULL;
 #endif
     instance->log_level = -1;
+    instance->log_suppress_interval = -1;
 
     mk_list_init(&instance->properties);
     mk_list_add(&instance->_head, &config->filters);
@@ -365,122 +447,174 @@ const char *flb_filter_name(struct flb_filter_instance *ins)
     return ins->name;
 }
 
-/* Initialize all filter plugins */
-int flb_filter_init_all(struct flb_config *config)
+int flb_filter_plugin_property_check(struct flb_filter_instance *ins,
+                                     struct flb_config *config)
+{
+    int ret = 0;
+    struct mk_list *config_map;
+    struct flb_filter_plugin *p = ins->p;
+
+    if (p->config_map) {
+        /*
+         * Create a dynamic version of the configmap that will be used by the specific
+         * instance in question.
+         */
+        config_map = flb_config_map_create(config, p->config_map);
+        if (!config_map) {
+            flb_error("[filter] error loading config map for '%s' plugin",
+                      p->name);
+            return -1;
+        }
+        ins->config_map = config_map;
+
+        /* Validate incoming properties against config map */
+        ret = flb_config_map_properties_check(ins->p->name,
+                                              &ins->properties, ins->config_map);
+        if (ret == -1) {
+            if (config->program_name) {
+                flb_helper("try the command: %s -F %s -h\n",
+                           config->program_name, ins->p->name);
+            }
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+int flb_filter_match_property_existence(struct flb_filter_instance *ins)
+{
+    if (!ins->match
+#ifdef FLB_HAVE_REGEX
+              && !ins->match_regex
+#endif
+        ) {
+        return FLB_FALSE;
+    }
+
+    return FLB_TRUE;
+}
+
+int flb_filter_init(struct flb_config *config, struct flb_filter_instance *ins)
 {
     int ret;
     uint64_t ts;
     char *name;
+    struct flb_filter_plugin *p;
+
+    if (flb_filter_match_property_existence(ins) == FLB_FALSE) {
+        flb_warn("[filter] NO match rule for %s filter instance, unloading.",
+                 ins->name);
+        return -1;
+    }
+
+    if (ins->log_level == -1 && config->log) {
+        ins->log_level = config->log->level;
+    }
+
+    p = ins->p;
+
+    /* Get name or alias for the instance */
+    name = (char *) flb_filter_name(ins);
+    ts = cfl_time_now();
+
+    /* CMetrics */
+    ins->cmt = cmt_create();
+    if (!ins->cmt) {
+        flb_error("[filter] could not create cmetrics context: %s",
+                  flb_filter_name(ins));
+        return -1;
+    }
+
+    /* Register generic filter plugin metrics */
+    ins->cmt_records = cmt_counter_create(ins->cmt,
+                                              "fluentbit", "filter",
+                                              "records_total",
+                                              "Total number of new records processed.",
+                                              1, (char *[]) {"name"});
+    cmt_counter_set(ins->cmt_records, ts, 0, 1, (char *[]) {name});
+
+    /* Register generic filter plugin metrics */
+    ins->cmt_bytes = cmt_counter_create(ins->cmt,
+                                              "fluentbit", "filter",
+                                              "bytes_total",
+                                              "Total number of new bytes processed.",
+                                              1, (char *[]) {"name"});
+    cmt_counter_set(ins->cmt_bytes, ts, 0, 1, (char *[]) {name});
+
+    /* Register generic filter plugin metrics */
+    ins->cmt_add_records = cmt_counter_create(ins->cmt,
+                                              "fluentbit", "filter",
+                                              "add_records_total",
+                                              "Total number of new added records.",
+                                              1, (char *[]) {"name"});
+    cmt_counter_set(ins->cmt_add_records, ts, 0, 1, (char *[]) {name});
+
+    /* Register generic filter plugin metrics */
+    ins->cmt_drop_records = cmt_counter_create(ins->cmt,
+                                              "fluentbit", "filter",
+                                              "drop_records_total",
+                                              "Total number of dropped records.",
+                                              1, (char *[]) {"name"});
+    cmt_counter_set(ins->cmt_drop_records, ts, 0, 1, (char *[]) {name});
+
+    /* OLD Metrics API */
+#ifdef FLB_HAVE_METRICS
+
+    /* Create the metrics context */
+    ins->metrics = flb_metrics_create(name);
+    if (!ins->metrics) {
+        flb_warn("[filter] cannot initialize metrics for %s filter, "
+                 "unloading.", name);
+        return -1;
+    }
+
+    /* Register filter metrics */
+    flb_metrics_add(FLB_METRIC_N_DROPPED, "drop_records", ins->metrics);
+    flb_metrics_add(FLB_METRIC_N_ADDED, "add_records", ins->metrics);
+    flb_metrics_add(FLB_METRIC_N_RECORDS, "records", ins->metrics);
+    flb_metrics_add(FLB_METRIC_N_BYTES, "bytes", ins->metrics);
+#endif
+
+    /*
+     * Before to call the initialization callback, make sure that the received
+     * configuration parameters are valid if the plugin is registering a config map.
+     */
+    if (flb_filter_plugin_property_check(ins, config) == -1) {
+        return -1;
+    }
+
+    if (is_active(&ins->properties) == FLB_FALSE) {
+        return 0;
+    }
+
+    /* Initialize the input */
+    if (p->cb_init) {
+        ret = p->cb_init(ins, config, ins->data);
+        if (ret != 0) {
+            flb_error("Failed initialize filter %s", ins->name);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/* Initialize all filter plugins */
+int flb_filter_init_all(struct flb_config *config)
+{
+    int ret;
     struct mk_list *tmp;
     struct mk_list *head;
-    struct mk_list *config_map;
-    struct flb_filter_plugin *p;
     struct flb_filter_instance *ins;
 
     /* Iterate all active filter instance plugins */
     mk_list_foreach_safe(head, tmp, &config->filters) {
         ins = mk_list_entry(head, struct flb_filter_instance, _head);
-
-        if (!ins->match
-#ifdef FLB_HAVE_REGEX
-            && !ins->match_regex
-#endif
-            ) {
-            flb_warn("[filter] NO match rule for %s filter instance, unloading.",
-                     ins->name);
+        ret = flb_filter_init(config, ins);
+        if (ret == -1) {
             flb_filter_instance_destroy(ins);
-            continue;
-        }
-        if (ins->log_level == -1) {
-            ins->log_level = config->log->level;
-        }
-
-        p = ins->p;
-
-        /* Get name or alias for the instance */
-        name = (char *) flb_filter_name(ins);
-        ts = cmt_time_now();
-
-        /* CMetrics */
-        ins->cmt = cmt_create();
-        if (!ins->cmt) {
-            flb_error("[filter] could not create cmetrics context: %s",
-                      flb_filter_name(ins));
             return -1;
-        }
-
-        /* Register generic filter plugin metrics */
-        ins->cmt_add_records = cmt_counter_create(ins->cmt,
-                                                  "fluentbit", "filter",
-                                                  "add_records_total",
-                                                  "Total number of new added records.",
-                                                  1, (char *[]) {"name"});
-        cmt_counter_set(ins->cmt_add_records, ts, 0, 1, (char *[]) {name});
-
-        /* Register generic filter plugin metrics */
-        ins->cmt_drop_records = cmt_counter_create(ins->cmt,
-                                                  "fluentbit", "filter",
-                                                  "drop_records_total",
-                                                  "Total number of dropped records.",
-                                                  1, (char *[]) {"name"});
-        cmt_counter_set(ins->cmt_drop_records, ts, 0, 1, (char *[]) {name});
-
-        /* OLD Metrics API */
-#ifdef FLB_HAVE_METRICS
-
-        /* Create the metrics context */
-        ins->metrics = flb_metrics_create(name);
-        if (!ins->metrics) {
-            flb_warn("[filter] cannot initialize metrics for %s filter, "
-                     "unloading.", name);
-            mk_list_del(&ins->_head);
-            flb_free(ins);
-            continue;
-        }
-
-        /* Register filter metrics */
-        flb_metrics_add(FLB_METRIC_N_DROPPED, "drop_records", ins->metrics);
-        flb_metrics_add(FLB_METRIC_N_ADDED, "add_records", ins->metrics);
-#endif
-
-        /*
-         * Before to call the initialization callback, make sure that the received
-         * configuration parameters are valid if the plugin is registering a config map.
-         */
-        if (p->config_map) {
-            /*
-             * Create a dynamic version of the configmap that will be used by the specific
-             * instance in question.
-             */
-            config_map = flb_config_map_create(config, p->config_map);
-            if (!config_map) {
-                flb_error("[filter] error loading config map for '%s' plugin",
-                          p->name);
-                return -1;
-            }
-            ins->config_map = config_map;
-
-            /* Validate incoming properties against config map */
-            ret = flb_config_map_properties_check(ins->p->name,
-                                                  &ins->properties, ins->config_map);
-            if (ret == -1) {
-                if (config->program_name) {
-                    flb_helper("try the command: %s -F %s -h\n",
-                               config->program_name, ins->p->name);
-                }
-                flb_filter_instance_destroy(ins);
-                return -1;
-            }
-        }
-
-        /* Initialize the input */
-        if (p->cb_init) {
-            ret = p->cb_init(ins, config, ins->data);
-            if (ret != 0) {
-                flb_error("Failed initialize filter %s", ins->name);
-                flb_filter_instance_destroy(ins);
-                return -1;
-            }
         }
     }
 

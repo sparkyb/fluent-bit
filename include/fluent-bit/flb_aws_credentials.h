@@ -118,12 +118,13 @@ struct flb_aws_provider_vtable {
  */
 struct flb_aws_provider {
     /*
-     * Fluent Bit is single-threaded but asynchonous. Co-routines are paused
-     * and resumed during blocking IO calls.
-     *
+     * Fluent Bit now has multi-threads/workers, need to a mutex to protect cred provider.
      * When a refresh is needed, only one co-routine should refresh.
+     * When one thread refreshes, the cached creds are freed and reset, there could be a double
+     * free without a lock.
+     * We use trylock to prevent deadlock.
      */
-    int locked;
+    pthread_mutex_t lock;
 
     struct flb_aws_provider_vtable *provider_vtable;
 
@@ -131,6 +132,13 @@ struct flb_aws_provider {
 
     /* Standard credentials chain is a list of providers */
     struct mk_list _head;
+
+    /* Provider managed dependencies; to delete on destroy */
+    struct flb_aws_provider *base_aws_provider;
+    struct flb_tls *cred_tls;   /* tls instances can't be re-used; aws provider requires
+                                   a separate one */
+    struct flb_tls *sts_tls;    /* one for the standard chain provider, one for sts
+                                   assume role */
 };
 
 /*
@@ -154,7 +162,50 @@ struct flb_aws_provider *flb_standard_chain_provider_create(struct flb_config
                                                             char *proxy,
                                                             struct
                                                             flb_aws_client_generator
-                                                            *generator);
+                                                            *generator,
+                                                            char *profile);
+
+/* Provide base configuration options for managed chain */
+#define FLB_AWS_CREDENTIAL_BASE_CONFIG_MAP(prefix)                                    \
+    {                                                                                 \
+     FLB_CONFIG_MAP_STR, prefix "region", NULL,                                       \
+     0, FLB_FALSE, 0,                                                                 \
+     "AWS region of your service"                                                     \
+    },                                                                                \
+    {                                                                                 \
+     FLB_CONFIG_MAP_STR, prefix "sts_endpoint", NULL,                                 \
+     0, FLB_FALSE, 0,                                                                 \
+     "Custom endpoint for the AWS STS API, used with the `" prefix "role_arn` option" \
+    },                                                                                \
+    {                                                                                 \
+     FLB_CONFIG_MAP_STR, prefix "role_arn", NULL,                                     \
+     0, FLB_FALSE, 0,                                                                 \
+     "ARN of an IAM role to assume (ex. for cross account access)"                    \
+    },                                                                                \
+    {                                                                                 \
+     FLB_CONFIG_MAP_STR, prefix "external_id", NULL,                                  \
+     0, FLB_FALSE, 0,                                                                 \
+     "Specify an external ID for the STS API, can be used with the `" prefix          \
+     "role_arn` parameter if your role requires an external ID."                      \
+    },                                                                                \
+    {                                                                                 \
+     FLB_CONFIG_MAP_STR, prefix "profile", NULL,                                      \
+     0, FLB_FALSE, 0,                                                                 \
+     "AWS Profile name. AWS Profiles can be configured with AWS CLI and are usually"  \
+     "stored in $HOME/.aws/ directory."                                               \
+    }
+/*
+ * Managed chain provider; Creates and manages removal of dependancies for an instance
+ */
+struct flb_aws_provider *flb_managed_chain_provider_create(struct flb_output_instance
+                                                           *ins,
+                                                           struct flb_config
+                                                           *config,
+                                                           char *config_key_prefix,
+                                                           char *proxy,
+                                                           struct
+                                                           flb_aws_client_generator
+                                                           *generator);
 
 /*
  * A provider that uses OIDC tokens provided by kubernetes to obtain
@@ -233,7 +284,7 @@ struct flb_aws_provider *flb_ec2_provider_create(struct flb_config *config,
 /*
  * New AWS Profile provider, reads from the shared credentials file
  */
-struct flb_aws_provider *flb_profile_provider_create();
+struct flb_aws_provider *flb_profile_provider_create(char* profile);
 
 /*
  * Helper functions

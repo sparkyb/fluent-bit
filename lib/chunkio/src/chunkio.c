@@ -25,6 +25,7 @@
 #include <chunkio/chunkio_compat.h>
 #include <chunkio/cio_os.h>
 #include <chunkio/cio_log.h>
+#include <chunkio/cio_file.h>
 #include <chunkio/cio_stream.h>
 #include <chunkio/cio_scan.h>
 #include <chunkio/cio_utils.h>
@@ -64,14 +65,48 @@ static int check_root_path(struct cio_ctx *ctx, const char *root_path)
     return access(root_path, W_OK);
 }
 
-struct cio_ctx *cio_create(const char *root_path,
-                           void (*log_cb), int log_level, int flags)
+void cio_options_init(struct cio_options *options)
+{
+    memset(options, 0, sizeof(struct cio_options));
+
+    options->initialized = CIO_INITIALIZED;
+
+    options->root_path = NULL;
+    options->user = NULL;
+    options->group = NULL;
+    options->chmod = NULL;
+    options->log_cb = NULL;
+    options->log_level = CIO_LOG_INFO;
+    options->flags = CIO_OPEN_RW;
+    options->realloc_size_hint = CIO_DISABLE_REALLOC_HINT;
+}
+
+struct cio_ctx *cio_create(struct cio_options *options)
 {
     int ret;
     struct cio_ctx *ctx;
+    struct cio_options default_options;
 
-    if (log_level < CIO_LOG_ERROR || log_level > CIO_LOG_TRACE) {
-        fprintf(stderr, "[cio] invalid log level, aborting");
+    if (options == NULL) {
+        cio_options_init(&default_options);
+        options = &default_options;
+    }
+    else {
+        if (options->initialized != CIO_INITIALIZED) {
+            /* the caller 'must' call cio_options_init() or pass NULL before creating a context */
+            fprintf(stderr, "[cio] 'options' has not been initialized properly\n");
+            return NULL;
+        }
+    }
+    
+    /* sanitize chunk open flags */
+    if (!(options->flags & CIO_OPEN_RW) && !(options->flags & CIO_OPEN_RD)) {
+        options->flags |= CIO_OPEN_RW;
+    }
+
+    if (options->log_level < CIO_LOG_ERROR ||
+        options->log_level > CIO_LOG_TRACE) {
+        fprintf(stderr, "[cio] invalid log level, aborting\n");
         return NULL;
     }
 #ifndef CIO_HAVE_BACKEND_FILESYSTEM
@@ -90,31 +125,82 @@ struct cio_ctx *cio_create(const char *root_path,
     mk_list_init(&ctx->streams);
     ctx->page_size = cio_getpagesize();
     ctx->max_chunks_up = CIO_MAX_CHUNKS_UP;
-    ctx->flags = flags;
+    ctx->options.flags = options->flags;
+    ctx->realloc_size_hint = CIO_DISABLE_REALLOC_HINT;
+
+    if (options->user != NULL) {
+        ctx->options.user = strdup(options->user);
+    }
+
+    if (options->group != NULL) {
+        ctx->options.group = strdup(options->group);
+    }
+
+    if (options->chmod != NULL) {
+        ctx->options.chmod = strdup(options->chmod);
+    }
 
     /* Counters */
     ctx->total_chunks = 0;
     ctx->total_chunks_up = 0;
 
     /* Logging */
-    cio_set_log_callback(ctx, log_cb);
-    cio_set_log_level(ctx, log_level);
+    cio_set_log_callback(ctx, options->log_cb);
+    cio_set_log_level(ctx, options->log_level);
 
     /* Check or initialize file system root path */
-    if (root_path) {
-        ret = check_root_path(ctx, root_path);
+    if (options->root_path) {
+        ret = check_root_path(ctx, options->root_path);
         if (ret == -1) {
             cio_log_error(ctx,
                           "[chunkio] cannot initialize root path %s\n",
-                          root_path);
+                          options->root_path);
             free(ctx);
             return NULL;
         }
 
-        ctx->root_path = strdup(root_path);
+        ctx->options.root_path = strdup(options->root_path);
     }
     else {
-        ctx->root_path = NULL;
+        ctx->options.root_path = NULL;
+    }
+
+    if (ctx->options.user != NULL) {
+        ret = cio_file_lookup_user(ctx->options.user, &ctx->processed_user);
+
+        if (ret != CIO_OK) {
+            cio_destroy(ctx);
+
+            return NULL;
+        }
+    }
+    else {
+        ctx->processed_user = NULL;
+    }
+
+    if (ctx->options.group != NULL) {
+        ret = cio_file_lookup_group(ctx->options.group, &ctx->processed_group);
+
+        if (ret != CIO_OK) {
+            cio_destroy(ctx);
+
+            return NULL;
+        }
+    }
+    else {
+        ctx->processed_group = NULL;
+    }
+
+    if (options->realloc_size_hint > 0) {
+        ret = cio_set_realloc_size_hint(ctx, options->realloc_size_hint);
+        if (ret == -1) {
+            cio_log_error(ctx,
+                          "[chunkio] cannot initialize with realloc size hint %d\n",
+                          options->realloc_size_hint);
+            cio_destroy(ctx);
+
+            return NULL;
+        }
     }
 
     return ctx;
@@ -124,7 +210,7 @@ int cio_load(struct cio_ctx *ctx, char *chunk_extension)
 {
     int ret;
 
-    if (ctx->root_path) {
+    if (ctx->options.root_path) {
         ret = cio_scan_streams(ctx, chunk_extension);
         return ret;
     }
@@ -199,13 +285,37 @@ void cio_destroy(struct cio_ctx *ctx)
     }
 
     cio_stream_destroy_all(ctx);
-    free(ctx->root_path);
+
+    if (ctx->options.user != NULL) {
+        free(ctx->options.user);
+    }
+
+    if (ctx->options.group != NULL) {
+        free(ctx->options.group);
+    }
+
+    if (ctx->options.chmod != NULL) {
+        free(ctx->options.chmod);
+    }
+
+    if (ctx->processed_user != NULL) {
+        free(ctx->processed_user);
+    }
+
+    if (ctx->processed_group != NULL) {
+        free(ctx->processed_group);
+    }
+
+    if (ctx->options.root_path != NULL) {
+        free(ctx->options.root_path);
+    }
+
     free(ctx);
 }
 
 void cio_set_log_callback(struct cio_ctx *ctx, void (*log_cb))
 {
-    ctx->log_cb = log_cb;
+    ctx->options.log_cb = log_cb;
 }
 
 int cio_set_log_level(struct cio_ctx *ctx, int level)
@@ -214,7 +324,7 @@ int cio_set_log_level(struct cio_ctx *ctx, int level)
         return -1;
     }
 
-    ctx->log_level = level;
+    ctx->options.log_level = level;
     return 0;
 }
 
@@ -226,4 +336,34 @@ int cio_set_max_chunks_up(struct cio_ctx *ctx, int n)
 
     ctx->max_chunks_up = n;
     return 0;
+}
+
+int cio_set_realloc_size_hint(struct cio_ctx *ctx, size_t realloc_size_hint)
+{
+    if (realloc_size_hint < CIO_REALLOC_HINT_MIN) {
+        cio_log_error(ctx,
+                      "[chunkio] cannot specify less than %zu bytes\n",
+                      CIO_REALLOC_HINT_MIN);
+        return -1;
+    }
+    else if (realloc_size_hint > CIO_REALLOC_HINT_MAX) {
+        cio_log_error(ctx,
+                      "[chunkio] cannot specify more than %zu bytes\n",
+                      CIO_REALLOC_HINT_MAX);
+        return -1;
+    }
+
+    ctx->realloc_size_hint = realloc_size_hint;
+
+    return 0;
+}
+
+void cio_enable_file_trimming(struct cio_ctx *ctx)
+{
+    ctx->options.flags |= CIO_TRIM_FILES;
+}
+
+void cio_disable_file_trimming(struct cio_ctx *ctx)
+{
+    ctx->options.flags &= ~CIO_TRIM_FILES;
 }

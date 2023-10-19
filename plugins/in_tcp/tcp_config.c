@@ -119,11 +119,34 @@ struct flb_in_tcp_config *tcp_config_init(struct flb_input_instance *ins)
         ctx->buffer_size  = (atoi(ctx->buffer_size_str) * 1024);
     }
 
+    ctx->log_encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+
+    if (ctx->log_encoder == NULL) {
+        flb_plg_error(ctx->ins, "could not initialize event encoder");
+        tcp_config_destroy(ctx);
+
+        ctx = NULL;
+    }
+
     return ctx;
 }
 
 int tcp_config_destroy(struct flb_in_tcp_config *ctx)
 {
+    if (ctx->log_encoder != NULL) {
+        flb_log_event_encoder_destroy(ctx->log_encoder);
+    }
+
+    if (ctx->collector_id != -1) {
+        flb_input_collector_delete(ctx->collector_id, ctx->ins);
+
+        ctx->collector_id = -1;
+    }
+
+    if (ctx->downstream != NULL) {
+        flb_downstream_destroy(ctx->downstream);
+    }
+
     flb_sds_destroy(ctx->separator);
     flb_free(ctx->tcp_port);
     flb_free(ctx);

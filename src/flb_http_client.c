@@ -40,9 +40,9 @@
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_http_client_debug.h>
 #include <fluent-bit/flb_utils.h>
+#include <fluent-bit/flb_base64.h>
 
 
-#include <mbedtls/base64.h>
 
 void flb_http_client_debug(struct flb_http_client *c,
                            struct flb_callback *cb_ctx)
@@ -62,7 +62,9 @@ int flb_http_strip_port_from_host(struct flb_http_client *c)
     struct mk_list *head;
     struct flb_kv *kv;
     char *out_host;
-    struct flb_upstream *u = c->u_conn->u;
+    struct flb_upstream *u;
+
+    u = c->u_conn->upstream;
 
     if (!c->host) {
         if (!u->proxied_host) {
@@ -557,7 +559,7 @@ static int add_host_and_content_length(struct flb_http_client *c)
     char *out_host;
     int out_port;
     size_t size;
-    struct flb_upstream *u = c->u_conn->u;
+    struct flb_upstream *u = c->u_conn->upstream;
 
     if (!c->host) {
         if (u->proxied_host) {
@@ -624,7 +626,7 @@ static int add_host_and_content_length(struct flb_http_client *c)
     return 0;
 }
 
-struct flb_http_client *flb_http_client(struct flb_upstream_conn *u_conn,
+struct flb_http_client *flb_http_client(struct flb_connection *u_conn,
                                         int method, const char *uri,
                                         const char *body, size_t body_len,
                                         const char *host, int port,
@@ -734,7 +736,7 @@ struct flb_http_client *flb_http_client(struct flb_upstream_conn *u_conn,
     }
 
     /* Is Upstream connection using keepalive mode ? */
-    if (u_conn->u->flags & FLB_IO_TCP_KA) {
+    if (flb_stream_get_flag_status(&u_conn->upstream->base, FLB_IO_TCP_KA)) {
         c->flags |= FLB_HTTP_KA;
     }
 
@@ -915,6 +917,30 @@ int flb_http_add_header(struct flb_http_client *c,
     return 0;
 }
 
+/*
+ * flb_http_get_header looks up a first value of request header.
+ * The return value should be destroyed after using.
+ * The return value is NULL, if the value is not found.
+ */
+flb_sds_t flb_http_get_header(struct flb_http_client *c,
+                              const char *key, size_t key_len)
+{
+    flb_sds_t ret_str;
+    struct flb_kv *kv;
+    struct mk_list *head = NULL;
+    struct mk_list *tmp  = NULL;
+
+    mk_list_foreach_safe(head, tmp, &c->headers) {
+        kv = mk_list_entry(head, struct flb_kv, _head);
+        if (flb_sds_casecmp(kv->key, key, key_len) == 0) {
+            ret_str = flb_sds_create(kv->val);
+            return ret_str;
+        }
+    }
+
+    return NULL;
+}
+
 static int http_header_push(struct flb_http_client *c, struct flb_kv *header)
 {
     char *tmp;
@@ -1004,7 +1030,7 @@ static void http_headers_destroy(struct flb_http_client *c)
 int flb_http_set_keepalive(struct flb_http_client *c)
 {
     /* check if 'keepalive' mode is enabled in the Upstream connection */
-    if (c->u_conn->u->net.keepalive == FLB_FALSE) {
+    if (flb_stream_is_keepalive(c->u_conn->stream)) {
         return -1;
     }
 
@@ -1080,7 +1106,7 @@ int flb_http_add_auth_header(struct flb_http_client *c,
     p[len_out] = '\0';
 
     memcpy(tmp, "Basic ", 6);
-    ret = mbedtls_base64_encode((unsigned char *) tmp + 6, sizeof(tmp) - 7, &b64_len,
+    ret = flb_base64_encode((unsigned char *) tmp + 6, sizeof(tmp) - 7, &b64_len,
                                 (unsigned char *) p, len_out);
     if (ret != 0) {
         flb_free(p);
@@ -1108,6 +1134,43 @@ int flb_http_proxy_auth(struct flb_http_client *c,
                         const char *user, const char *passwd)
 {
     return flb_http_add_auth_header(c, user, passwd, FLB_HTTP_HEADER_PROXY_AUTH);
+}
+
+int flb_http_bearer_auth(struct flb_http_client *c, const char *token)
+{
+    flb_sds_t header_buffer;
+    flb_sds_t header_line;
+    int       result;
+
+    result = -1;
+
+    if (token == NULL) {
+        token = "";
+
+        /* Shouldn't we log this and return instead of sending
+         * a malformed value?
+         */
+    }
+
+    header_buffer = flb_sds_create_size(strlen(token) + 64);
+
+    if (header_buffer == NULL) {
+        return -1;
+    }
+
+    header_line = flb_sds_printf(&header_buffer, "Bearer %s", token);
+
+    if (header_line != NULL) {
+        result = flb_http_add_header(c,
+                                     FLB_HTTP_HEADER_AUTH,
+                                     strlen(FLB_HTTP_HEADER_AUTH),
+                                     header_line,
+                                     flb_sds_len(header_line));
+    }
+
+    flb_sds_destroy(header_buffer);
+
+    return result;
 }
 
 
@@ -1223,8 +1286,10 @@ int flb_http_do(struct flb_http_client *c, size_t *bytes)
             ret = process_data(c);
             if (ret == FLB_HTTP_ERROR) {
                 flb_warn("[http_client] malformed HTTP response from %s:%i on "
-                         "connection #%i", c->u_conn->u->tcp_host,
-                         c->u_conn->u->tcp_port, c->u_conn->fd);
+                         "connection #%i",
+                         c->u_conn->upstream->tcp_host,
+                         c->u_conn->upstream->tcp_port,
+                         c->u_conn->fd);
                 return -1;
             }
             else if (ret == FLB_HTTP_OK) {
@@ -1236,7 +1301,8 @@ int flb_http_do(struct flb_http_client *c, size_t *bytes)
         }
         else {
             flb_error("[http_client] broken connection to %s:%i ?",
-                      c->u_conn->u->tcp_host, c->u_conn->u->tcp_port);
+                      c->u_conn->upstream->tcp_host,
+                      c->u_conn->upstream->tcp_port);
             return -1;
         }
     }
@@ -1253,7 +1319,8 @@ int flb_http_do(struct flb_http_client *c, size_t *bytes)
             /* Do not recycle the connection (no more keepalive) */
             flb_upstream_conn_recycle(c->u_conn, FLB_FALSE);
             flb_debug("[http_client] server %s:%i will close connection #%i",
-                      c->u_conn->u->tcp_host, c->u_conn->u->tcp_port,
+                      c->u_conn->upstream->tcp_host,
+                      c->u_conn->upstream->tcp_port,
                       c->u_conn->fd);
         }
     }
@@ -1274,9 +1341,9 @@ int flb_http_do(struct flb_http_client *c, size_t *bytes)
  * http proxy.
  * More: https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods/CONNECT
  */
-int flb_http_client_proxy_connect(struct flb_upstream_conn *u_conn)
+int flb_http_client_proxy_connect(struct flb_connection *u_conn)
 {
-    struct flb_upstream *u = u_conn->u;
+    struct flb_upstream *u = u_conn->upstream;
     struct flb_http_client *c;
     size_t b_sent;
     int ret = -1;

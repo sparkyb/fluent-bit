@@ -18,7 +18,9 @@
  */
 
 #include <fluent-bit/flb_input_plugin.h>
+#include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_upstream.h>
+
 #include <cmetrics/cmt_decode_prometheus.h>
 
 #include "prom_scrape.h"
@@ -27,6 +29,7 @@ static struct prom_scrape *prom_scrape_create(struct flb_input_instance *ins,
                                               struct flb_config *config)
 {
     int ret;
+    int upstream_flags;
     struct prom_scrape *ctx;
     struct flb_upstream *upstream;
 
@@ -51,8 +54,15 @@ static struct prom_scrape *prom_scrape_create(struct flb_input_instance *ins,
         return NULL;
     }
 
+    upstream_flags = FLB_IO_TCP;
+
+    if (ins->use_tls) {
+        upstream_flags |= FLB_IO_TLS;
+    }
+
     upstream = flb_upstream_create(config, ins->host.name, ins->host.port,
-                                   FLB_IO_TCP, NULL);
+                                   upstream_flags, ins->tls);
+
     if (!upstream) {
         flb_plg_error(ins, "upstream initialization error");
         return NULL;
@@ -68,15 +78,15 @@ static int collect_metrics(struct prom_scrape *ctx)
     char errbuf[1024];
     size_t b_sent;
     struct flb_http_client *c;
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct cmt *cmt = NULL;
     struct cmt_decode_prometheus_parse_opts opts = {0};
 
     /* get upstream connection */
     u_conn = flb_upstream_conn_get(ctx->upstream);
     if (!u_conn) {
-        flb_plg_error(ctx->ins, "could not get an upstream connection to %s:%s",
-                      ctx->ins->host.port, ctx->ins->host.port);
+        flb_plg_error(ctx->ins, "could not get an upstream connection to %s:%u",
+                      ctx->ins->host.name, ctx->ins->host.port);
         return -1;
     }
 
@@ -88,7 +98,14 @@ static int collect_metrics(struct prom_scrape *ctx)
         goto client_error;
     }
 
-    flb_http_buffer_size(c, 1024 * 1000 * 10);
+    flb_http_buffer_size(c, ctx->buffer_max_size);
+
+    /* Auth headers */
+    if (ctx->http_user && ctx->http_passwd) { /* Basic */
+        flb_http_basic_auth(c, ctx->http_user, ctx->http_passwd);
+    } else if (ctx->bearer_token) { /* Bearer token */
+        flb_http_bearer_auth(c, ctx->bearer_token);
+    }
 
     ret = flb_http_do(c, &b_sent);
     if (ret != 0) {
@@ -108,7 +125,7 @@ static int collect_metrics(struct prom_scrape *ctx)
     }
 
     /* configure prometheus decoder options */
-    opts.default_timestamp = cmt_time_now();
+    opts.default_timestamp = cfl_time_now();
     opts.errbuf = errbuf;
     opts.errbuf_size = sizeof(errbuf);
 
@@ -197,9 +214,33 @@ static struct flb_config_map config_map[] = {
     },
 
     {
+     FLB_CONFIG_MAP_SIZE, "buffer_max_size", HTTP_BUFFER_MAX_SIZE,
+     0, FLB_TRUE, offsetof(struct prom_scrape, buffer_max_size),
+     ""
+    },
+
+    {
      FLB_CONFIG_MAP_STR, "metrics_path", DEFAULT_URI,
      0, FLB_TRUE, offsetof(struct prom_scrape, metrics_path),
      "Set the metrics URI endpoint, it must start with a forward slash."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "http_user", NULL,
+     0, FLB_TRUE, offsetof(struct prom_scrape, http_user),
+     "Set HTTP auth user"
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "http_passwd", "",
+     0, FLB_TRUE, offsetof(struct prom_scrape, http_passwd),
+     "Set HTTP auth password"
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "bearer_token", NULL,
+     0, FLB_TRUE, offsetof(struct prom_scrape, bearer_token),
+     "Set bearer token auth"
     },
 
     /* EOF */
@@ -217,5 +258,4 @@ struct flb_input_plugin in_prometheus_scrape_plugin = {
     .cb_exit      = cb_prom_scrape_exit,
     .config_map   = config_map,
     .flags        = FLB_INPUT_NET | FLB_INPUT_CORO,
-    .event_type   = FLB_INPUT_METRICS
 };

@@ -96,6 +96,11 @@ uint64_t flb_time_to_nanosec(struct flb_time *tm)
     return (((uint64_t)tm->tm.tv_sec * 1000000000L) + tm->tm.tv_nsec);
 }
 
+uint64_t flb_time_to_millisec(struct flb_time *tm)
+{
+    return (((uint64_t)tm->tm.tv_sec * 1000L) + tm->tm.tv_nsec / 1000000L);
+}
+
 int flb_time_add(struct flb_time *base, struct flb_time *duration, struct flb_time *result)
 {
     if (base == NULL || duration == NULL|| result == NULL) {
@@ -129,7 +134,7 @@ int flb_time_diff(struct flb_time *time1,
         }
         else if(result->tm.tv_sec == 0){
             /* underflow */
-            return -1;
+            return -2;
         }
         else{
             result->tm.tv_nsec = ONESEC_IN_NSEC
@@ -139,7 +144,7 @@ int flb_time_diff(struct flb_time *time1,
     }
     else {
         /* underflow */
-        return -1;
+        return -3;
     }
     return 0;
 }
@@ -183,7 +188,9 @@ int flb_time_append_to_mpack(mpack_writer_t *writer, struct flb_time *tm, int fm
         memcpy(&ext_data, &tmp, 4);
         tmp = htonl((uint32_t)tm->tm.tv_nsec);/* nanosecond */
         memcpy(&ext_data[4], &tmp, 4);
-        mpack_write_ext(writer, 8/*fixext8*/, ext_data, sizeof(ext_data));
+
+        /* https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#eventtime-ext-format */
+        mpack_write_ext(writer, 0 /*ext type=0 */, ext_data, sizeof(ext_data));
         break;
 
     default:
@@ -245,6 +252,14 @@ int flb_time_append_to_msgpack(struct flb_time *tm, msgpack_packer *pk, int fmt)
     return ret;
 }
 
+static inline int is_eventtime(msgpack_object *obj)
+{
+    if (obj->via.ext.type != 0 || obj->via.ext.size != 8) {
+        return FLB_FALSE;
+    }
+    return FLB_TRUE;
+}
+
 int flb_time_msgpack_to_time(struct flb_time *time, msgpack_object *obj)
 {
     uint32_t tmp;
@@ -259,6 +274,11 @@ int flb_time_msgpack_to_time(struct flb_time *time, msgpack_object *obj)
         time->tm.tv_nsec = ((obj->via.f64 - time->tm.tv_sec) * ONESEC_IN_NSEC);
         break;
     case MSGPACK_OBJECT_EXT:
+        if (is_eventtime(obj) != FLB_TRUE) {
+            flb_warn("[time] unknown ext type. type=%d size=%d",
+                     obj->via.ext.type, obj->via.ext.size);
+            return -1;
+        }
         memcpy(&tmp, &obj->via.ext.ptr[0], 4);
         time->tm.tv_sec = (uint32_t) ntohl(tmp);
         memcpy(&tmp, &obj->via.ext.ptr[4], 4);
@@ -281,11 +301,15 @@ int flb_time_pop_from_mpack(struct flb_time *time, mpack_reader_t *reader)
     uint32_t tmp;
     char extbuf[8];
     size_t ext_len;
+    int header_detected;
 
     if (time == NULL) {
         return -1;
     }
 
+    header_detected = FLB_FALSE;
+
+    /* consume the record array */
     tag = mpack_read_tag(reader);
 
     if (mpack_reader_error(reader) != mpack_ok ||
@@ -294,7 +318,30 @@ int flb_time_pop_from_mpack(struct flb_time *time, mpack_reader_t *reader)
         return -1;
     }
 
+    /* consume the header array or the timestamp
+     * depending on the chunk encoding
+     */
     tag = mpack_read_tag(reader);
+
+    if (mpack_reader_error(reader) != mpack_ok) {
+        return -1;
+    }
+
+    if (mpack_tag_type(&tag) == mpack_type_array) {
+        if(mpack_tag_array_count(&tag) != 2) {
+            return -1;
+        }
+
+        /* consume the timestamp element */
+        tag = mpack_read_tag(reader);
+
+        if (mpack_reader_error(reader) != mpack_ok) {
+            return -1;
+        }
+
+        header_detected = FLB_TRUE;
+    }
+
     switch (mpack_tag_type(&tag)) {
         case mpack_type_int:
             i = mpack_tag_int_value(&tag);
@@ -321,7 +368,7 @@ int flb_time_pop_from_mpack(struct flb_time *time, mpack_reader_t *reader)
         case mpack_type_ext:
             ext_len = mpack_tag_ext_length(&tag);
             if (ext_len != 8) {
-                flb_warn("expecting ext_len is 8, got %" PRId64, ext_len);
+                flb_warn("expecting ext_len is 8, got %ld", ext_len);
                 return -1;
             }
             mpack_read_bytes(reader, extbuf, ext_len);
@@ -331,8 +378,14 @@ int flb_time_pop_from_mpack(struct flb_time *time, mpack_reader_t *reader)
             time->tm.tv_nsec = (uint32_t) ntohl(tmp);
             break;
         default:
-            flb_warn("unknown time format %s", tag.type);
+            flb_warn("unknown time format %d", tag.type);
             return -1;
+    }
+
+    /* discard the metadata map if present */
+
+    if (header_detected) {
+        mpack_discard(reader);
     }
 
     return 0;
@@ -353,6 +406,15 @@ int flb_time_pop_from_msgpack(struct flb_time *time, msgpack_unpacked *upk,
     }
 
     obj = upk->data.via.array.ptr[0];
+
+    if (obj.type == MSGPACK_OBJECT_ARRAY) {
+        if (obj.via.array.size != 2) {
+            return -1;
+        }
+
+        obj = obj.via.array.ptr[0];
+    }
+
     *map = &upk->data.via.array.ptr[1];
 
     ret = flb_time_msgpack_to_time(time, &obj);

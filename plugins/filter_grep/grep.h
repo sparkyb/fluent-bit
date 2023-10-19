@@ -26,6 +26,7 @@
 #include <fluent-bit/flb_record_accessor.h>
 
 /* rule types */
+#define GREP_NO_RULE  0
 #define GREP_REGEX    1
 #define GREP_EXCLUDE  2
 
@@ -33,12 +34,16 @@
 #define GREP_RET_KEEP     0
 #define GREP_RET_EXCLUDE  1
 
+enum _logical_op{
+    GREP_LOGICAL_OP_LEGACY,
+    GREP_LOGICAL_OP_OR,
+    GREP_LOGICAL_OP_AND
+} logical_op;
+
 struct grep_ctx {
     struct mk_list rules;
+    int logical_op;
     struct flb_filter_instance *ins;
-    /* config map */
-    struct mk_list *regex_map;
-    struct mk_list *exclude_map;
 };
 
 struct grep_rule {

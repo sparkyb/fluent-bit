@@ -23,6 +23,8 @@
 #include <fluent-bit/flb_error.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_pack.h>
+#include <fluent-bit/flb_sds.h>
+#include <fluent-bit/flb_sds_list.h>
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/record_accessor/flb_ra_parser.h>
 #include <msgpack.h>
@@ -30,6 +32,45 @@
 #include "flb_tests_internal.h"
 
 #include <stdlib.h>
+
+static int create_map(char *input_json, msgpack_object *out_map,
+                      char **out_buf, msgpack_unpacked *out_result)
+{
+    int len;
+    int ret;
+    size_t out_size;
+    int type;
+    size_t off = 0;
+
+    if (input_json == NULL || out_map == NULL) {
+        return -1;
+    }
+    len = strlen(input_json);
+    ret = flb_pack_json(input_json, len, out_buf, &out_size, &type, NULL);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("can't convert. input=%s", input_json);
+        exit(EXIT_FAILURE);
+    }
+    /* Unpack msgpack object */
+    msgpack_unpacked_init(out_result);
+    msgpack_unpack_next(out_result, *out_buf, out_size, &off);
+    *out_map = out_result->data;
+
+    return 0;
+}
+
+static int set_str_to_msgpack_object(char *str, msgpack_object *obj)
+{
+    if (str == NULL || obj == NULL) {
+        return -1;
+    }
+        /* create value object to overwrite */
+    obj->type     = MSGPACK_OBJECT_STR;
+    obj->via.str.size = strlen(str);
+    obj->via.str.ptr  = str;
+    return 0;
+}
+
 
 void cb_keys()
 {
@@ -106,7 +147,7 @@ void cb_translate()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -178,7 +219,7 @@ void cb_translate_tag()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -233,7 +274,7 @@ void cb_dots_subkeys()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -301,7 +342,7 @@ void cb_array_id()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -371,7 +412,7 @@ void cb_get_kv_pair()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -409,6 +450,299 @@ void cb_get_kv_pair()
     msgpack_unpacked_destroy(&result);
 }
 
+void cb_update_key_val()
+{
+    int ret;
+    size_t off = 0;
+    char *json;
+    flb_sds_t fmt;
+    flb_sds_t updated_fmt;
+    char *fmt_out_key = "updated_key";
+    char *fmt_out_val = "updated_val";
+
+    char *out_buf = NULL;
+    size_t out_size = 0;
+
+    msgpack_unpacked result;
+    msgpack_unpacked out_result;
+
+    msgpack_object map;
+    msgpack_object *start_key = NULL;
+    msgpack_object *out_key = NULL;
+    msgpack_object *out_val = NULL;
+    void *updated_map;
+    msgpack_object in_key;
+    msgpack_object in_val;
+
+    struct flb_record_accessor *ra;
+    struct flb_record_accessor *updated_ra;
+
+    /* Sample JSON message */
+    json =
+        "{\"key1\": \"something\", "
+        "\"kubernetes\": "
+        "   [true, "
+        "    false, "
+        "    {\"a\": false, "
+        "     \"annotations\": { "
+        "                       \"fluentbit.io/tag\": \"thetag\""
+        "}}]}";
+    ret = create_map(json, &map, &out_buf, &result);
+    if(!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed create map");
+        if (out_buf != NULL) {
+            flb_free(out_buf);
+        }
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    fmt = flb_sds_create("$kubernetes[2]['annotations']['fluentbit.io/tag']");
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    if(!TEST_CHECK(ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    updated_fmt = flb_sds_create("$kubernetes[2]['annotations']['updated_key']");
+    updated_ra = flb_ra_create(updated_fmt, FLB_FALSE);
+    if(!TEST_CHECK(updated_ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* create key object to overwrite */
+    ret = set_str_to_msgpack_object(fmt_out_key, &in_key);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed to set object");
+        exit(EXIT_FAILURE);
+    }
+    /* create value object to overwrite */
+    ret = set_str_to_msgpack_object(fmt_out_val, &in_val);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed to set object");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Update only value */
+    ret = flb_ra_update_kv_pair(ra, map, (void**)&updated_map, &out_size, &in_key, &in_val);
+    TEST_CHECK(ret == 0);
+    off = 0;
+    msgpack_unpacked_init(&out_result);
+    if (msgpack_unpack_next(&out_result, updated_map, out_size, &off)
+        != MSGPACK_UNPACK_SUCCESS) {
+        TEST_MSG("failed to unpack");
+        exit(EXIT_FAILURE);
+    }
+    ret = flb_ra_get_kv_pair(updated_ra, out_result.data, &start_key, &out_key, &out_val);
+    if (!TEST_CHECK(ret == 0)) {
+        printf("print out_result\n");
+        msgpack_object_print(stdout, out_result.data);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Check updated key */
+    TEST_CHECK(out_key->type == MSGPACK_OBJECT_STR);
+    TEST_CHECK(out_key->via.str.size == strlen(fmt_out_key));
+    TEST_CHECK(memcmp(out_key->via.str.ptr, fmt_out_key, strlen(fmt_out_key)) == 0);
+
+    /* Check updated val */
+    TEST_CHECK(out_val->type == MSGPACK_OBJECT_STR);
+    TEST_CHECK(out_val->via.str.size == strlen(fmt_out_val));
+    TEST_CHECK(memcmp(out_val->via.str.ptr, fmt_out_val, strlen(fmt_out_val)) == 0);
+
+    msgpack_unpacked_destroy(&out_result);
+    msgpack_unpacked_destroy(&result);
+    flb_free(updated_map);
+    flb_sds_destroy(updated_fmt);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(updated_ra);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+}
+
+void cb_update_val()
+{
+    int ret;
+    size_t off = 0;
+    char *json;
+    flb_sds_t fmt;
+    char *fmt_out = "updated";
+    char *out_buf = NULL;
+    size_t out_size = 0;
+
+    msgpack_unpacked result;
+    msgpack_unpacked out_result;
+
+    msgpack_object map;
+    msgpack_object *start_key = NULL;
+    msgpack_object *out_key = NULL;
+    msgpack_object *out_val = NULL;
+    void *updated_map;
+    msgpack_object in_val;
+
+    struct flb_record_accessor *ra;
+
+    /* Sample JSON message */
+    json =
+        "{\"key1\": \"something\", "
+        "\"kubernetes\": "
+        "   [true, "
+        "    false, "
+        "    {\"a\": false, "
+        "     \"annotations\": { "
+        "                       \"fluentbit.io/tag\": \"thetag\""
+        "}}]}";
+    ret = create_map(json, &map, &out_buf, &result);
+    if(!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed create map");
+        if (out_buf != NULL) {
+            flb_free(out_buf);
+        }
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    fmt = flb_sds_create("$kubernetes[2]['annotations']['fluentbit.io/tag']");
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    if(!TEST_CHECK(ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* create value object to overwrite */
+    ret = set_str_to_msgpack_object(fmt_out, &in_val);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed to set object");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Update only value */
+    ret = flb_ra_update_kv_pair(ra, map, (void**)&updated_map, &out_size, NULL, &in_val);
+    TEST_CHECK(ret == 0);
+    off = 0;
+    msgpack_unpacked_init(&out_result);
+    if (msgpack_unpack_next(&out_result, updated_map, out_size, &off)
+        != MSGPACK_UNPACK_SUCCESS) {
+        TEST_MSG("failed to unpack");
+        exit(EXIT_FAILURE);
+    }
+    ret = flb_ra_get_kv_pair(ra, out_result.data, &start_key, &out_key, &out_val);
+    if (!TEST_CHECK(ret == 0)) {
+        printf("print out_result\n");
+        msgpack_object_print(stdout, out_result.data);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Check updated val */
+    TEST_CHECK(out_val->type == MSGPACK_OBJECT_STR);
+    TEST_CHECK(out_val->via.str.size == strlen(fmt_out));
+    TEST_CHECK(memcmp(out_val->via.str.ptr, fmt_out, strlen(fmt_out)) == 0);
+
+    msgpack_unpacked_destroy(&out_result);
+    msgpack_unpacked_destroy(&result);
+    flb_free(updated_map);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+}
+
+void cb_update_key()
+{
+    int ret;
+    size_t off = 0;
+    char *json;
+    flb_sds_t fmt;
+    flb_sds_t updated_fmt;
+    char *fmt_out = "updated_key";
+
+
+    char *out_buf = NULL;
+    size_t out_size = 0;
+
+    msgpack_unpacked result;
+    msgpack_unpacked out_result;
+
+    msgpack_object map;
+    msgpack_object *start_key = NULL;
+    msgpack_object *out_key = NULL;
+    msgpack_object *out_val = NULL;
+    void *updated_map;
+    msgpack_object in_key;
+
+    struct flb_record_accessor *ra;
+    struct flb_record_accessor *updated_ra;
+
+    /* Sample JSON message */
+    json =
+        "{\"key1\": \"something\", "
+        "\"kubernetes\": "
+        "   [true, "
+        "    false, "
+        "    {\"a\": false, "
+        "     \"annotations\": { "
+        "                       \"fluentbit.io/tag\": \"thetag\""
+        "}}]}";
+    ret = create_map(json, &map, &out_buf, &result);
+    if(!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed create map");
+        if (out_buf != NULL) {
+            flb_free(out_buf);
+        }
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    fmt = flb_sds_create("$kubernetes[2]['annotations']['fluentbit.io/tag']");
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    if(!TEST_CHECK(ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    updated_fmt = flb_sds_create("$kubernetes[2]['annotations']['updated_key']");
+    updated_ra = flb_ra_create(updated_fmt, FLB_FALSE);
+    if(!TEST_CHECK(updated_ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* create key object to overwrite */
+    ret = set_str_to_msgpack_object(fmt_out, &in_key);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed to set object");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Update only value */
+    ret = flb_ra_update_kv_pair(ra, map, (void**)&updated_map, &out_size, &in_key, NULL);
+    TEST_CHECK(ret == 0);
+    off = 0;
+    msgpack_unpacked_init(&out_result);
+    if (msgpack_unpack_next(&out_result, updated_map, out_size, &off)
+        != MSGPACK_UNPACK_SUCCESS) {
+        TEST_MSG("failed to unpack");
+        exit(EXIT_FAILURE);
+    }
+    ret = flb_ra_get_kv_pair(updated_ra, out_result.data, &start_key, &out_key, &out_val);
+    if (!TEST_CHECK(ret == 0)) {
+        printf("print out_result\n");
+        msgpack_object_print(stdout, out_result.data);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Check updated key */
+    TEST_CHECK(out_key->type == MSGPACK_OBJECT_STR);
+    TEST_CHECK(out_key->via.str.size == strlen(fmt_out));
+    TEST_CHECK(memcmp(out_key->via.str.ptr, fmt_out, strlen(fmt_out)) == 0);
+
+    msgpack_unpacked_destroy(&out_result);
+    msgpack_unpacked_destroy(&result);
+    flb_free(updated_map);
+    flb_sds_destroy(updated_fmt);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(updated_ra);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+}
+  
 void cb_dash_key()
 {
     int len;
@@ -430,7 +764,7 @@ void cb_dash_key()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -490,7 +824,7 @@ void cb_dot_and_slash_key()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -599,7 +933,7 @@ void cb_key_order_lookup()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -638,7 +972,7 @@ void cb_issue_4917()
     json = "{\"tool\": \"fluent\", \"sub\": {\"s1\": {\"s2\": \"bit\"}}}";
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -689,6 +1023,685 @@ void cb_issue_4917()
     msgpack_unpacked_destroy(&result);
 }
 
+void cb_update_root_key()
+{
+    int ret;
+    size_t off = 0;
+    char *json;
+    flb_sds_t fmt;
+    flb_sds_t updated_fmt;
+    char *fmt_out = "updated_key";
+
+
+    char *out_buf = NULL;
+    size_t out_size = 0;
+
+    msgpack_unpacked result;
+    msgpack_unpacked out_result;
+
+    msgpack_object map;
+    msgpack_object *start_key = NULL;
+    msgpack_object *out_key = NULL;
+    msgpack_object *out_val = NULL;
+    void *updated_map;
+    msgpack_object in_key;
+
+    struct flb_record_accessor *ra;
+    struct flb_record_accessor *updated_ra;
+
+    /* Sample JSON message */
+    json =
+        "{\"key1\": \"something\", "
+        "\"kubernetes\": "
+        "   [true, "
+        "    false, "
+        "    {\"a\": false, "
+        "     \"annotations\": { "
+        "                       \"fluentbit.io/tag\": \"thetag\""
+        "}}]}";
+    ret = create_map(json, &map, &out_buf, &result);
+    if(!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed create map");
+        if (out_buf != NULL) {
+            flb_free(out_buf);
+        }
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    fmt = flb_sds_create("$key1");
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    if(!TEST_CHECK(ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    updated_fmt = flb_sds_create("$updated_key");
+    updated_ra = flb_ra_create(updated_fmt, FLB_FALSE);
+    if(!TEST_CHECK(updated_ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* create key object to overwrite */
+    ret = set_str_to_msgpack_object(fmt_out, &in_key);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed to set object");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Update only value */
+    ret = flb_ra_update_kv_pair(ra, map, (void**)&updated_map, &out_size, &in_key, NULL);
+    TEST_CHECK(ret == 0);
+    off = 0;
+    msgpack_unpacked_init(&out_result);
+    if (msgpack_unpack_next(&out_result, updated_map, out_size, &off)
+        != MSGPACK_UNPACK_SUCCESS) {
+        TEST_MSG("failed to unpack");
+        exit(EXIT_FAILURE);
+    }
+    ret = flb_ra_get_kv_pair(updated_ra, out_result.data, &start_key, &out_key, &out_val);
+    if (!TEST_CHECK(ret == 0)) {
+        printf("print out_result\n");
+        msgpack_object_print(stdout, out_result.data);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Check updated key */
+    TEST_CHECK(out_key->type == MSGPACK_OBJECT_STR);
+    TEST_CHECK(out_key->via.str.size == strlen(fmt_out));
+    TEST_CHECK(memcmp(out_key->via.str.ptr, fmt_out, strlen(fmt_out)) == 0);
+
+    msgpack_unpacked_destroy(&out_result);
+    msgpack_unpacked_destroy(&result);
+    flb_free(updated_map);
+    flb_sds_destroy(updated_fmt);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(updated_ra);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+}
+
+void cb_update_root_key_val()
+{
+    int ret;
+    size_t off = 0;
+    char *json;
+    flb_sds_t fmt;
+    flb_sds_t updated_fmt;
+    char *fmt_out_key = "updated_key";
+    char *fmt_out_val = "updated_val";
+
+    char *out_buf = NULL;
+    size_t out_size = 0;
+
+    msgpack_unpacked result;
+    msgpack_unpacked out_result;
+
+    msgpack_object map;
+    msgpack_object *start_key = NULL;
+    msgpack_object *out_key = NULL;
+    msgpack_object *out_val = NULL;
+    void *updated_map;
+    msgpack_object in_key;
+    msgpack_object in_val;
+
+    struct flb_record_accessor *ra;
+    struct flb_record_accessor *updated_ra;
+
+    /* Sample JSON message */
+    json =
+        "{\"key1\": \"something\", "
+        "\"kubernetes\": "
+        "   [true, "
+        "    false, "
+        "    {\"a\": false, "
+        "     \"annotations\": { "
+        "                       \"fluentbit.io/tag\": \"thetag\""
+        "}}]}";
+    ret = create_map(json, &map, &out_buf, &result);
+    if(!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed create map");
+        if (out_buf != NULL) {
+            flb_free(out_buf);
+        }
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    fmt = flb_sds_create("$key1");
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    if(!TEST_CHECK(ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    updated_fmt = flb_sds_create("$updated_key");
+    updated_ra = flb_ra_create(updated_fmt, FLB_FALSE);
+    if(!TEST_CHECK(updated_ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* create key object to overwrite */
+    ret = set_str_to_msgpack_object(fmt_out_key, &in_key);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed to set object");
+        exit(EXIT_FAILURE);
+    }
+    /* create value object to overwrite */
+    ret = set_str_to_msgpack_object(fmt_out_val, &in_val);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed to set object");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Update only value */
+    ret = flb_ra_update_kv_pair(ra, map, (void**)&updated_map, &out_size, &in_key, &in_val);
+    TEST_CHECK(ret == 0);
+    off = 0;
+    msgpack_unpacked_init(&out_result);
+    if (msgpack_unpack_next(&out_result, updated_map, out_size, &off)
+        != MSGPACK_UNPACK_SUCCESS) {
+        TEST_MSG("failed to unpack");
+        exit(EXIT_FAILURE);
+    }
+    ret = flb_ra_get_kv_pair(updated_ra, out_result.data, &start_key, &out_key, &out_val);
+    if (!TEST_CHECK(ret == 0)) {
+        printf("print out_result\n");
+        msgpack_object_print(stdout, out_result.data);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Check updated key */
+    TEST_CHECK(out_key->type == MSGPACK_OBJECT_STR);
+    TEST_CHECK(out_key->via.str.size == strlen(fmt_out_key));
+    TEST_CHECK(memcmp(out_key->via.str.ptr, fmt_out_key, strlen(fmt_out_key)) == 0);
+
+    /* Check updated val */
+    TEST_CHECK(out_val->type == MSGPACK_OBJECT_STR);
+    TEST_CHECK(out_val->via.str.size == strlen(fmt_out_val));
+    TEST_CHECK(memcmp(out_val->via.str.ptr, fmt_out_val, strlen(fmt_out_val)) == 0);
+
+    msgpack_unpacked_destroy(&out_result);
+    msgpack_unpacked_destroy(&result);
+    flb_free(updated_map);
+    flb_sds_destroy(updated_fmt);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(updated_ra);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+}
+
+void cb_add_key_val()
+{
+    int ret;
+    size_t off = 0;
+    char *json;
+    flb_sds_t fmt;
+    flb_sds_t updated_fmt;
+    char *fmt_out_key = "add_key";
+    char *fmt_out_val = "add_val";
+
+    char *out_buf = NULL;
+    size_t out_size = 0;
+
+    msgpack_unpacked result;
+    msgpack_unpacked out_result;
+
+    msgpack_object map;
+    msgpack_object *start_key = NULL;
+    msgpack_object *out_key = NULL;
+    msgpack_object *out_val = NULL;
+    void *updated_map;
+    msgpack_object in_val;
+
+    struct flb_record_accessor *ra;
+    struct flb_record_accessor *updated_ra;
+
+    /* Sample JSON message */
+    json =
+        "{\"key1\": \"something\", "
+        "\"kubernetes\": "
+        "   [true, "
+        "    false, "
+        "    {\"a\": false, "
+        "     \"annotations\": { "
+        "                       \"fluentbit.io/tag\": \"thetag\""
+        "}}]}";
+    ret = create_map(json, &map, &out_buf, &result);
+    if(!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed create map");
+        if (out_buf != NULL) {
+            flb_free(out_buf);
+        }
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    fmt = flb_sds_create("$kubernetes[2]['annotations']['add_key']");
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    if(!TEST_CHECK(ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    updated_fmt = flb_sds_create("$kubernetes[2]['annotations']['add_key']");
+    updated_ra = flb_ra_create(updated_fmt, FLB_FALSE);
+    if(!TEST_CHECK(updated_ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* create value object to overwrite */
+    ret = set_str_to_msgpack_object(fmt_out_val, &in_val);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed to set object");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Add key/value */
+    ret = flb_ra_append_kv_pair(ra, map, (void**)&updated_map, &out_size, &in_val);
+    TEST_CHECK(ret == 0);
+
+    off = 0;
+    msgpack_unpacked_init(&out_result);
+    ret = msgpack_unpack_next(&out_result, updated_map, out_size, &off);
+    if (!TEST_CHECK(ret == MSGPACK_UNPACK_SUCCESS)) {
+        TEST_MSG("failed to unpack");
+        exit(EXIT_FAILURE);
+    }
+    ret = flb_ra_get_kv_pair(updated_ra, out_result.data, &start_key, &out_key, &out_val);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("print out_result\n");
+        msgpack_object_print(stdout, out_result.data);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Check updated key */
+    TEST_CHECK(out_key->type == MSGPACK_OBJECT_STR);
+    TEST_CHECK(out_key->via.str.size == strlen(fmt_out_key));
+    TEST_CHECK(memcmp(out_key->via.str.ptr, fmt_out_key, strlen(fmt_out_key)) == 0);
+
+    /* Check updated val */
+    TEST_CHECK(out_val->type == MSGPACK_OBJECT_STR);
+    TEST_CHECK(out_val->via.str.size == strlen(fmt_out_val));
+    TEST_CHECK(memcmp(out_val->via.str.ptr, fmt_out_val, strlen(fmt_out_val)) == 0);
+
+    msgpack_unpacked_destroy(&out_result);
+    msgpack_unpacked_destroy(&result);
+    flb_free(updated_map);
+    flb_sds_destroy(updated_fmt);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(updated_ra);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+}
+
+void cb_add_root_key_val()
+{
+    int ret;
+    size_t off = 0;
+    char *json;
+    flb_sds_t fmt;
+    flb_sds_t updated_fmt;
+    char *fmt_out_key = "add_key";
+    char *fmt_out_val = "add_val";
+
+    char *out_buf = NULL;
+    size_t out_size = 0;
+
+    msgpack_unpacked result;
+    msgpack_unpacked out_result;
+
+    msgpack_object map;
+    msgpack_object *start_key = NULL;
+    msgpack_object *out_key = NULL;
+    msgpack_object *out_val = NULL;
+    void *updated_map;
+    msgpack_object in_val;
+
+    struct flb_record_accessor *ra;
+    struct flb_record_accessor *updated_ra;
+
+    /* Sample JSON message */
+    json =
+        "{\"key1\": \"something\", "
+        "\"kubernetes\": "
+        "   [true, "
+        "    false, "
+        "    {\"a\": false, "
+        "     \"annotations\": { "
+        "                       \"fluentbit.io/tag\": \"thetag\""
+        "}}]}";
+    ret = create_map(json, &map, &out_buf, &result);
+    if(!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed create map");
+        if (out_buf != NULL) {
+            flb_free(out_buf);
+        }
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    fmt = flb_sds_create("$add_key");
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    if(!TEST_CHECK(ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    updated_fmt = flb_sds_create("$add_key");
+    updated_ra = flb_ra_create(updated_fmt, FLB_FALSE);
+    if(!TEST_CHECK(updated_ra != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* create value object to overwrite */
+    ret = set_str_to_msgpack_object(fmt_out_val, &in_val);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed to set object");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Add key/value */
+    ret = flb_ra_append_kv_pair(ra, map, (void**)&updated_map, &out_size, &in_val);
+    TEST_CHECK(ret == 0);
+
+    off = 0;
+    msgpack_unpacked_init(&out_result);
+    ret = msgpack_unpack_next(&out_result, updated_map, out_size, &off);
+    if (!TEST_CHECK(ret == MSGPACK_UNPACK_SUCCESS)) {
+        TEST_MSG("failed to unpack");
+        exit(EXIT_FAILURE);
+    }
+    ret = flb_ra_get_kv_pair(updated_ra, out_result.data, &start_key, &out_key, &out_val);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("print out_result\n");
+        msgpack_object_print(stdout, out_result.data);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Check updated key */
+    TEST_CHECK(out_key->type == MSGPACK_OBJECT_STR);
+    TEST_CHECK(out_key->via.str.size == strlen(fmt_out_key));
+    TEST_CHECK(memcmp(out_key->via.str.ptr, fmt_out_key, strlen(fmt_out_key)) == 0);
+
+    /* Check updated val */
+    TEST_CHECK(out_val->type == MSGPACK_OBJECT_STR);
+    TEST_CHECK(out_val->via.str.size == strlen(fmt_out_val));
+    TEST_CHECK(memcmp(out_val->via.str.ptr, fmt_out_val, strlen(fmt_out_val)) == 0);
+
+    msgpack_unpacked_destroy(&out_result);
+    msgpack_unpacked_destroy(&result);
+    flb_free(updated_map);
+    flb_sds_destroy(updated_fmt);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(updated_ra);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+}
+
+void cb_ra_translate_check()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    char *fmt;
+    flb_sds_t str;
+    msgpack_unpacked result;
+    msgpack_object map;
+    struct flb_record_accessor *ra;
+    int check_translation = FLB_TRUE;
+
+    /* Sample JSON message */
+    json = "{\"root.with/symbols\": \"something\"}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    fmt = flb_sds_create("$root");
+    if (!TEST_CHECK(fmt != NULL)) {
+        exit(EXIT_FAILURE);
+    }
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack msgpack object */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    /* Do translation - with check enabled */
+    str = flb_ra_translate_check(ra, NULL, -1, map, NULL, check_translation);
+    /* since translation fails and check is enabled, it returns NULL */
+    TEST_CHECK(str == NULL);
+    if (str) {
+        exit(EXIT_FAILURE);
+    }
+
+    flb_sds_destroy(str);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+    msgpack_unpacked_destroy(&result);
+}
+
+/*
+ * https://github.com/fluent/fluent-bit/issues/5936
+ *  If the last nested element is an array, record accessor can't get its value.
+ */
+void cb_issue_5936_last_array()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    char *fmt;
+    char *fmt_out;
+    flb_sds_t str;
+    msgpack_unpacked result;
+    msgpack_object map;
+    struct flb_record_accessor *ra;
+
+    /* Sample JSON message */
+    json ="{ \"key\": {\"nested\":[\"val0\", \"val1\"]}}";
+
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    fmt = flb_sds_create("$key['nested'][1]");
+    fmt_out = "val1";
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack msgpack object */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    /* Do translation */
+    str = flb_ra_translate(ra, NULL, -1, map, NULL);
+    TEST_CHECK(str != NULL);
+    if (!str) {
+        exit(EXIT_FAILURE);
+    }
+
+    TEST_CHECK(flb_sds_len(str) == strlen(fmt_out));
+    TEST_CHECK(memcmp(str, fmt_out, strlen(fmt_out)) == 0);
+    printf("== input ==\n%s\n== output ==\n%s\n", str, fmt_out);
+
+    flb_sds_destroy(str);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+    msgpack_unpacked_destroy(&result);
+}
+
+struct char_list_ra_str{
+    char **strs;
+    char *expect;
+};
+
+void cb_ra_create_str_from_list()
+{
+    char *case1[] = {"a", NULL};
+    char *case2[] = {"aa", "bb", "cc", NULL};
+
+    struct char_list_ra_str testcases[] = {
+        { .strs = &case1[0], .expect = "$a"},
+        { .strs = &case2[0], .expect = "$aa['bb']['cc']"},
+    };
+    size_t case_size = sizeof(testcases)/sizeof(struct char_list_ra_str);
+    int case_i;
+    struct flb_sds_list *list = NULL;
+    flb_sds_t ret_str;
+    char *str;
+    int i;
+    int ret;
+
+    for (case_i = 0; case_i < case_size; case_i++) {
+        list = flb_sds_list_create();
+        if (!TEST_CHECK(list != NULL)) {
+            TEST_MSG("%d: flb_sds_list_create failed", case_i);
+            exit(EXIT_FAILURE);
+        }
+        i = 0;
+        while(testcases[case_i].strs[i] != NULL) {
+            str = testcases[case_i].strs[i];
+            ret = flb_sds_list_add(list, str, strlen(str));
+            if (!TEST_CHECK(ret == 0)) {
+                TEST_MSG("%d: flb_sds_list_add failed", case_i);
+                flb_sds_list_destroy(list);
+                exit(EXIT_FAILURE);
+            }
+            i++;
+        }
+
+        ret_str = flb_ra_create_str_from_list(list);
+        if (!TEST_CHECK(ret_str != NULL)) {
+            TEST_MSG("%d: flb_ra_create_str_from failed", case_i);
+            flb_sds_list_destroy(list);
+            exit(EXIT_FAILURE);
+        }
+        if (!TEST_CHECK(strcmp(testcases[case_i].expect, ret_str) == 0)) {
+            TEST_MSG("%d: strcmp error.got=%s expect=%s", case_i, ret_str, testcases[case_i].expect);
+        }
+
+        flb_sds_destroy(ret_str);
+        flb_sds_list_destroy(list);
+    }
+
+
+    /* Error if we pass empty list */
+    list = flb_sds_list_create();
+    if (!TEST_CHECK(list != NULL)) {
+        TEST_MSG("flb_sds_list_create failed");
+        exit(EXIT_FAILURE);
+    }
+    ret_str = flb_ra_create_str_from_list(list);
+    if (!TEST_CHECK(ret_str == NULL)) {
+        TEST_MSG("flb_ra_create_str_from should be failed");
+        flb_sds_list_destroy(list);
+        exit(EXIT_FAILURE);
+    }
+    flb_sds_list_destroy(list);
+}
+
+/*
+ * https://github.com/fluent/fluent-bit/issues/7330
+ */
+void cb_issue_7330_single_char()
+{
+    int ret;
+    int type;
+    char *json;
+    char *out_buf = NULL;
+    size_t out_size;
+    size_t off = 0;
+    flb_sds_t input = NULL;
+    flb_sds_t out_tag = NULL;
+    struct flb_regex_search regex_result;
+    struct flb_record_accessor *ra_tag = NULL;
+    msgpack_unpacked result;
+    msgpack_object map;
+
+    json = "{\"tool\":\"fluent\"}";
+    ret = flb_pack_json(json, strlen(json), &out_buf, &out_size, &type, NULL);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("flb_pack_json failed");
+        exit(EXIT_FAILURE);
+    }
+
+    input = flb_sds_create("b");
+    if (!TEST_CHECK(input != NULL)) {
+        goto issue_7330;
+    }
+
+    /* create flb_record_accessor from single character */
+    ra_tag = flb_ra_create(input, FLB_FALSE);
+    if (!TEST_CHECK(ra_tag != NULL)) {
+        TEST_MSG("flb_ra_create failed");
+        goto issue_7330;
+    }
+
+    /* Unpack msgpack object */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    /* Do translation */
+    out_tag = flb_ra_translate(ra_tag, "old", 3, map, &regex_result);
+    msgpack_unpacked_destroy(&result);
+    if (!TEST_CHECK(out_tag != NULL)) {
+        TEST_MSG("flb_ra_translate failed");
+        goto issue_7330;
+    }
+    else if (!TEST_CHECK(flb_sds_len(out_tag) > 0)) {
+        TEST_MSG("out_tag len error. len=%zd", flb_sds_len(out_tag));
+        goto issue_7330;
+    }
+
+ issue_7330:
+    if (input) {
+        flb_sds_destroy(input);
+    }
+    if (out_tag) {
+        flb_sds_destroy(out_tag);
+    }
+    if (out_buf) {
+        flb_free(out_buf);
+    }
+    if (ra_tag) {
+        flb_ra_destroy(ra_tag);
+    }
+}
+
 TEST_LIST = {
     { "keys"            , cb_keys},
     { "dash_key"        , cb_dash_key},
@@ -702,6 +1715,17 @@ TEST_LIST = {
     { "array_id"        , cb_array_id},
     { "get_kv_pair"     , cb_get_kv_pair},
     { "key_order_lookup", cb_key_order_lookup},
+    { "update_key_val", cb_update_key_val},
+    { "update_key", cb_update_key},
+    { "update_val", cb_update_val},
+    { "update_root_key", cb_update_root_key},
+    { "update_root_key_val", cb_update_root_key_val},
+    { "add_key_val", cb_add_key_val},
+    { "add_root_key_val", cb_add_root_key_val},
     { "issue_4917"      , cb_issue_4917},
+    { "flb_ra_translate_check" , cb_ra_translate_check},
+    { "issue_5936_last_array"      , cb_issue_5936_last_array},
+    { "ra_create_str_from_list", cb_ra_create_str_from_list},
+    { "issue_7330_single_character"  , cb_issue_7330_single_char},
     { NULL }
 };

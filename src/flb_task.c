@@ -256,10 +256,12 @@ static struct flb_task *task_alloc(struct flb_config *config)
     mk_list_init(&task->routes);
     mk_list_init(&task->retries);
 
+    pthread_mutex_init(&task->lock, NULL);
+
     return task;
 }
 
-/* Return the number of tasks with 'running status' */
+/* Return the number of tasks with 'running status' or tasks with retries */
 int flb_task_running_count(struct flb_config *config)
 {
     int count = 0;
@@ -272,7 +274,7 @@ int flb_task_running_count(struct flb_config *config)
         ins = mk_list_entry(head, struct flb_input_instance, _head);
         mk_list_foreach(t_head, &ins->tasks) {
             task = mk_list_entry(t_head, struct flb_task, _head);
-            if (task->users > 0) {
+            if (task->users > 0 || mk_list_size(&task->retries) > 0) {
                 count++;
             }
         }
@@ -420,12 +422,13 @@ struct flb_task *flb_task_create(uint64_t ref_id,
         }
 
         if (flb_routes_mask_get_bit(task_ic->routes_mask, o_ins->id) != 0) {
-            route = flb_malloc(sizeof(struct flb_task_route));
+            route = flb_calloc(1, sizeof(struct flb_task_route));
             if (!route) {
                 flb_errno();
                 continue;
             }
 
+            route->status = FLB_TASK_ROUTE_INACTIVE;
             route->out = o_ins;
             mk_list_add(&route->_head, &task->routes);
             count++;
@@ -482,4 +485,36 @@ void flb_task_destroy(struct flb_task *task, int del)
         flb_event_chunk_destroy(task->event_chunk);
     }
     flb_free(task);
+}
+
+struct flb_task_queue* flb_task_queue_create() {
+    struct flb_task_queue *tq;
+    tq = flb_malloc(sizeof(struct flb_task_queue));
+    if (!tq) {
+        flb_errno();
+        return NULL;
+    }
+    mk_list_init(&tq->pending);
+    mk_list_init(&tq->in_progress);
+    return tq;
+}
+
+void flb_task_queue_destroy(struct flb_task_queue *queue) {
+    struct flb_task_enqueued *queued_task;
+    struct mk_list *tmp;
+    struct mk_list *head;
+
+    mk_list_foreach_safe(head, tmp, &queue->pending) {
+        queued_task = mk_list_entry(head, struct flb_task_enqueued, _head);
+        mk_list_del(&queued_task->_head);
+        flb_free(queued_task);
+    }
+
+    mk_list_foreach_safe(head, tmp, &queue->in_progress) {
+        queued_task = mk_list_entry(head, struct flb_task_enqueued, _head);
+        mk_list_del(&queued_task->_head);
+        flb_free(queued_task);
+    }
+
+    flb_free(queue);
 }

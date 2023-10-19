@@ -6,23 +6,27 @@ set(src
   flb_mp.c
   flb_kv.c
   flb_api.c
+  flb_csv.c
   flb_lib.c
   flb_log.c
   flb_env.c
   flb_file.c
   flb_uri.c
-  flb_hash.c
+  flb_hash_table.c
   flb_help.c
   flb_pack.c
   flb_pack_gelf.c
   flb_sds.c
+  flb_sds_list.c
   flb_pipe.c
   flb_meta.c
   flb_kernel.c
   flb_custom.c
   flb_input.c
   flb_input_chunk.c
+  flb_input_log.c
   flb_input_metric.c
+  flb_input_trace.c
   flb_input_thread.c
   flb_filter.c
   flb_output.c
@@ -40,6 +44,8 @@ set(src
   flb_scheduler.c
   flb_io.c
   flb_storage.c
+  flb_connection.c
+  flb_downstream.c
   flb_upstream.c
   flb_upstream_ha.c
   flb_upstream_node.c
@@ -48,11 +54,14 @@ set(src
   flb_coro.c
   flb_time.c
   flb_sosreport.c
-  flb_sha512.c
+  flb_hmac.c
+  flb_hash.c
+  flb_crypto.c
   flb_random.c
   flb_plugin.c
   flb_gzip.c
   flb_snappy.c
+  flb_compression.c
   flb_http_client.c
   flb_callback.c
   flb_strptime.c
@@ -62,6 +71,13 @@ set(src
   flb_typecast.c
   flb_event.c
   flb_base64.c
+  flb_ring_buffer.c
+  flb_log_event_decoder.c
+  flb_log_event_encoder.c
+  flb_log_event_encoder_primitives.c
+  flb_log_event_encoder_dynamic_field.c
+  flb_processor.c
+  flb_reload.c
   )
 
 # Config format
@@ -193,9 +209,9 @@ if(FLB_JEMALLOC)
 endif()
 
 if(FLB_REGEX)
-  set(extra_libs
-    ${extra_libs}
-    "libonigmo")
+  set(FLB_DEPS
+    ${FLB_DEPSS}
+    onigmo-static)
   set(src
     ${src}
     "flb_regex.c"
@@ -222,6 +238,13 @@ if(FLB_STATIC_CONF)
   set(src
     ${src}
     "flb_config_static.c"
+    )
+endif()
+
+if(FLB_CHUNK_TRACE)
+  set(src
+    ${src}
+    "flb_chunk_trace.c"
     )
 endif()
 
@@ -295,6 +318,16 @@ if(FLB_PROXY_GO)
   set(FLB_PROXY_PLUGINS ${FLB_PROXY_PLUGINS} flb-plugin-proxy-go)
 endif()
 
+# WASM runtime
+if(FLB_WASM)
+  add_subdirectory(wasm)
+endif()
+
+# WAMRC compiler
+if(FLB_WAMRC)
+  add_subdirectory(wamrc)
+endif()
+
 # HTTP Server
 if(FLB_HTTP_SERVER)
   set(FLB_DEPS
@@ -311,23 +344,34 @@ set(FLB_DEPS
   )
 endif()
 
+# WASM runtime
+if(FLB_WASM)
+  set(FLB_DEPS
+    ${FLB_DEPS}
+    vmlib-static
+    flb-wasm-static)
+endif()
+
 # Set static dependencies
 set(FLB_DEPS
   ${FLB_DEPS}
+  cfl-static
+  fluent-otel-proto
+  cmetrics-static
+  ctraces-static
   mk_core
   jsmn
   msgpack-c-static
   mpack-static
   chunkio-static
   miniz
-  xxhash
-  cmetrics-static
+
   ${FLB_PLUGINS}
   ${FLB_PROXY_PLUGINS}
   ${extra_libs}
-  mbedtls
   c-ares
   snappy-c
+  lwrb
   )
 
 if(OPENSSL_FOUND)
@@ -443,7 +487,7 @@ if(FLB_BINARY)
   endif()
 
   if(FLB_REGEX)
-    target_link_libraries(fluent-bit-bin libonigmo)
+    target_link_libraries(fluent-bit-bin onigmo-static)
   endif()
 
   if(FLB_JEMALLOC)
@@ -472,13 +516,19 @@ if(FLB_BINARY)
   endif()
 
   # Detect init system, install upstart, systemd or init.d script
-  if(IS_DIRECTORY /lib/systemd/system)
+
+  # Handle issues with detection on some systems during build
+  if(NOT SYSTEMD_UNITDIR AND IS_DIRECTORY /lib/systemd/system)
+    set(SYSTEMD_UNITDIR  /lib/systemd/system)
+  endif()
+  
+  if(SYSTEMD_UNITDIR)
     set(FLB_SYSTEMD_SCRIPT "${PROJECT_SOURCE_DIR}/init/${FLB_OUT_NAME}.service")
     configure_file(
       "${PROJECT_SOURCE_DIR}/init/systemd.in"
       ${FLB_SYSTEMD_SCRIPT}
       )
-    install(FILES ${FLB_SYSTEMD_SCRIPT} COMPONENT binary DESTINATION /lib/systemd/system)
+    install(FILES ${FLB_SYSTEMD_SCRIPT} COMPONENT binary DESTINATION ${SYSTEMD_UNITDIR})
     install(DIRECTORY DESTINATION ${FLB_INSTALL_CONFDIR} COMPONENT binary)
   elseif(IS_DIRECTORY /usr/share/upstart)
     set(FLB_UPSTART_SCRIPT "${PROJECT_SOURCE_DIR}/init/${FLB_OUT_NAME}.conf")
@@ -495,6 +545,12 @@ if(FLB_BINARY)
   if(FLB_SYSTEM_WINDOWS)
     install(FILES
       "${PROJECT_SOURCE_DIR}/conf/fluent-bit-win32.conf"
+      DESTINATION ${FLB_INSTALL_CONFDIR}
+      COMPONENT binary
+      RENAME "${FLB_OUT_NAME}.conf")
+  elseif(FLB_SYSTEM_MACOS)
+    install(FILES
+      "${PROJECT_SOURCE_DIR}/conf/fluent-bit-macos.conf"
       DESTINATION ${FLB_INSTALL_CONFDIR}
       COMPONENT binary
       RENAME "${FLB_OUT_NAME}.conf")

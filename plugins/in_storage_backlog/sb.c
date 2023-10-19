@@ -23,6 +23,7 @@
 #include <fluent-bit/flb_storage.h>
 #include <fluent-bit/flb_utils.h>
 #include <chunkio/chunkio.h>
+#include <chunkio/cio_error.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -90,7 +91,7 @@ static int sb_append_chunk_to_segregated_backlogs(struct cio_chunk  *target_chun
 int sb_segregate_chunks(struct flb_config *config);
 
 int sb_release_output_queue_space(struct flb_output_instance *output_plugin,
-                                  size_t                      required_space);
+                                  ssize_t                    *required_space);
 
 ssize_t sb_get_releasable_output_queue_space(struct flb_output_instance *output_plugin,
                                              size_t                      required_space);
@@ -327,6 +328,7 @@ int sb_segregate_chunks(struct flb_config *config)
     struct mk_list    *tmp;
     struct mk_list    *stream_iterator;
     struct mk_list    *chunk_iterator;
+    int                chunk_error;
     struct flb_sb     *context;
     struct cio_stream *stream;
     struct cio_chunk  *chunk;
@@ -349,7 +351,22 @@ int sb_segregate_chunks(struct flb_config *config)
             chunk = mk_list_entry(chunk_iterator, struct cio_chunk, _head);
 
             if (!cio_chunk_is_up(chunk)) {
-                cio_chunk_up_force(chunk);
+                ret = cio_chunk_up_force(chunk);
+                if (ret == CIO_CORRUPTED) {
+                    if (config->storage_del_bad_chunks) {
+                        chunk_error = cio_error_get(chunk);
+
+                        if (chunk_error == CIO_ERR_BAD_FILE_SIZE ||
+                            chunk_error == CIO_ERR_BAD_LAYOUT)
+                        {
+                            flb_plg_error(context->ins, "discarding irrecoverable chunk %s/%s", stream->name, chunk->name);
+
+                            cio_chunk_close(chunk, CIO_TRUE);
+                        }
+                    }
+
+                    continue;
+                }
             }
 
             if (!cio_chunk_is_up(chunk)) {
@@ -424,9 +441,10 @@ ssize_t sb_get_releasable_output_queue_space(struct flb_output_instance *output_
 }
 
 int sb_release_output_queue_space(struct flb_output_instance *output_plugin,
-                                  size_t                      required_space)
+                                  ssize_t                    *required_space)
 {
     struct mk_list      *chunk_iterator_tmp;
+    struct cio_chunk    *underlying_chunk;
     struct mk_list      *chunk_iterator;
     size_t               released_space;
     struct flb_sb       *context;
@@ -452,18 +470,17 @@ int sb_release_output_queue_space(struct flb_output_instance *output_plugin,
         chunk = mk_list_entry(chunk_iterator, struct sb_out_chunk, _head);
 
         released_space += chunk->size;
+        underlying_chunk = chunk->chunk;
 
-        cio_chunk_close(chunk->chunk, FLB_TRUE);
-        sb_remove_chunk_from_segregated_backlogs(chunk->chunk, context);
+        sb_remove_chunk_from_segregated_backlogs(underlying_chunk, context);
+        cio_chunk_close(underlying_chunk, FLB_TRUE);
 
-        if (released_space >= required_space) {
+        if (released_space >= *required_space) {
             break;
         }
     }
 
-    if (released_space < required_space) {
-        return -3;
-    }
+    *required_space -= released_space;
 
     return 0;
 }
@@ -545,7 +562,7 @@ static int cb_queue_chunks(struct flb_input_instance *in,
                  */
                 tmp_ic.chunk = chunk_instance->chunk;
 
-                /* Retrieve the event type: FLB_INPUT_LOGS or FLB_INPUT_METRICS */
+                /* Retrieve the event type: FLB_INPUT_LOGS, FLB_INPUT_METRICS of FLB_INPUT_TRACES */
                 ret = flb_input_chunk_get_event_type(&tmp_ic);
                 if (ret == -1) {
                     flb_plg_error(ctx->ins, "removing chunk with wrong metadata "
@@ -601,6 +618,7 @@ static int cb_queue_chunks(struct flb_input_instance *in,
                  * queue but we need to leave it in the remainder queues.
                  */
                 sb_remove_chunk_from_segregated_backlogs(chunk_instance->chunk, ctx);
+                cio_chunk_down(ch);
 
                 /* check our limits */
                 total += size;

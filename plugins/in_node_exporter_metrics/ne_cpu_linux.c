@@ -25,6 +25,24 @@
 
 #include <unistd.h>
 
+/*
+ * See kernel documentation for a description:
+ * https://www.kernel.org/doc/html/latest/filesystems/proc.html
+ *
+ * user: normal processes executing in user mode
+ * nice: niced processes executing in user mode
+ * system: processes executing in kernel mode
+ * idle: twiddling thumbs
+ * iowait: In a word, iowait stands for waiting for I/O to complete. But there are several problems:
+ * irq: servicing interrupts
+ * softirq: servicing softirqs
+ * steal: involuntary wait
+ * guest: running a normal guest
+ * guest_nice: running a niced guest
+ *
+ * Ensure to pick the correct version of the documentation, older versions here:
+ * https://github.com/torvalds/linux/tree/master/Documentation
+ */
 struct cpu_stat_info {
     double user;
     double nice;
@@ -109,7 +127,7 @@ static int cpu_thermal_update(struct flb_ne *ctx, uint64_t ts)
             continue;
         }
 
-        /* Phisical ID */
+        /* Physical ID */
         ret = ne_utils_file_read_uint64(ctx->path_sysfs,
                                         entry->str,
                                         "topology", "physical_package_id",
@@ -130,20 +148,19 @@ static int cpu_thermal_update(struct flb_ne *ctx, uint64_t ts)
                                         "thermal_throttle", "core_throttle_count",
                                         &core_throttle_count);
         if (ret != 0) {
-            flb_plg_error(ctx->ins,
+            flb_plg_debug(ctx->ins,
                           "CPU is missing core_throttle_count: %s",
                           entry->str);
-            continue;
         }
+        else {
+            snprintf(tmp1, sizeof(tmp1) -1, "%" PRIu64, core_id);
+            snprintf(tmp2, sizeof(tmp2) -1, "%" PRIu64, physical_package_id);
 
-        snprintf(tmp1, sizeof(tmp1) -1, "%" PRIu64, core_id);
-        snprintf(tmp2, sizeof(tmp2) -1, "%" PRIu64, physical_package_id);
-
-        /* Set new value */
-        cmt_counter_set(ctx->cpu_core_throttles, ts,
-                        (double) core_throttle_count,
-                        2, (char *[]) {tmp1, tmp2});
-
+            /* Set new value */
+            cmt_counter_set(ctx->cpu_core_throttles, ts,
+                            (double) core_throttle_count,
+                            2, (char *[]) {tmp1, tmp2});
+        }
 
         /* Only update this entry once */
         if (package_throttles_set[physical_package_id] != 0) {
@@ -157,16 +174,16 @@ static int cpu_thermal_update(struct flb_ne *ctx, uint64_t ts)
                                         "thermal_throttle", "package_throttle_count",
                                         &package_throttle_count);
         if (ret != 0) {
-            flb_plg_error(ctx->ins,
+            flb_plg_debug(ctx->ins,
                           "CPU is missing package_throttle_count: %s",
                           entry->str);
-            continue;
         }
-
-        /* Set new value */
-        cmt_counter_set(ctx->cpu_package_throttles, ts,
-                        (double) package_throttle_count,
-                        1, (char *[]) {tmp2});
+        else {
+            /* Set new value */
+            cmt_counter_set(ctx->cpu_package_throttles, ts,
+                            (double) package_throttle_count,
+                            1, (char *[]) {tmp2});
+        }
     }
     flb_slist_destroy(&list);
 
@@ -223,8 +240,14 @@ static int stat_line(char *line, struct cpu_stat_info *st)
                  &st->steal,
                  &st->guest,
                  &st->guest_nice);
-    if (ret != 10) {
+
+    /* On some older kernels the 'guest_nice' value may be missing */
+    if (ret < 9) {
         return -1;
+    }
+    /* Ensure we zero initialise it */
+    if ( ret == 9 ) {
+        st->guest_nice = 0;
     }
 
     /* Convert to seconds based on USER_HZ kernel param */
@@ -364,7 +387,7 @@ int ne_cpu_update(struct flb_ne *ctx)
 {
     uint64_t ts;
 
-    ts = cmt_time_now();
+    ts = cfl_time_now();
 
     cpu_thermal_update(ctx, ts);
     cpu_stat_update(ctx, ts);

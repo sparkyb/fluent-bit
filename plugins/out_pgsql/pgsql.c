@@ -92,6 +92,9 @@ static int cb_pgsql_init(struct flb_output_instance *ins,
         ctx->db_table = flb_sds_create(FLB_PGSQL_TABLE);
     }
 
+    /* connection options */
+    ctx->conn_options = flb_output_get_property("connection_options", ins);
+
     if (!ctx->db_table) {
         flb_errno();
         pgsql_conf_destroy(ctx);
@@ -209,7 +212,7 @@ static int cb_pgsql_init(struct flb_output_instance *ins,
         return -1;
     }
 
-    /* Maybe use the timestamp with the TZ specefied */
+    /* Maybe use the timestamp with the TZ specified */
     /* in the postgresql connection? */
     snprintf(query, str_len,
              "CREATE TABLE IF NOT EXISTS %s "

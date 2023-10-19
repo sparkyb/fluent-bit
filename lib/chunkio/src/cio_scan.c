@@ -28,6 +28,7 @@
 #include <chunkio/cio_file.h>
 #include <chunkio/cio_memfs.h>
 #include <chunkio/cio_chunk.h>
+#include <chunkio/cio_error.h>
 #include <chunkio/cio_log.h>
 
 #ifdef _WIN32
@@ -47,14 +48,14 @@ static int cio_scan_stream_files(struct cio_ctx *ctx, struct cio_stream *st,
     DIR *dir;
     struct dirent *ent;
 
-    len = strlen(ctx->root_path) + strlen(st->name) + 2;
+    len = strlen(ctx->options.root_path) + strlen(st->name) + 2;
     path = malloc(len);
     if (!path) {
         cio_errno();
         return -1;
     }
 
-    ret = snprintf(path, len, "%s/%s", ctx->root_path, st->name);
+    ret = snprintf(path, len, "%s/%s", ctx->options.root_path, st->name);
     if (ret == -1) {
         cio_errno();
         free(path);
@@ -98,8 +99,22 @@ static int cio_scan_stream_files(struct cio_ctx *ctx, struct cio_stream *st,
             }
         }
 
+        ctx->last_chunk_error = 0;
+
         /* register every directory as a stream */
-        cio_chunk_open(ctx, st, ent->d_name, ctx->flags, 0, &err);
+        cio_chunk_open(ctx, st, ent->d_name, ctx->options.flags, 0, &err);
+
+        if (ctx->options.flags & CIO_DELETE_IRRECOVERABLE) {
+            if (err == CIO_CORRUPTED) {
+                if (ctx->last_chunk_error == CIO_ERR_BAD_FILE_SIZE ||
+                    ctx->last_chunk_error == CIO_ERR_BAD_LAYOUT)
+                {
+                    cio_log_error(ctx, "[cio scan] discarding irrecoverable chunk");
+
+                    cio_chunk_delete(ctx, st, ent->d_name);
+                }
+            }
+        }
     }
 
     closedir(dir);
@@ -115,13 +130,13 @@ int cio_scan_streams(struct cio_ctx *ctx, char *chunk_extension)
     struct dirent *ent;
     struct cio_stream *st;
 
-    dir = opendir(ctx->root_path);
+    dir = opendir(ctx->options.root_path);
     if (!dir) {
         cio_errno();
         return -1;
     }
 
-    cio_log_debug(ctx, "[cio scan] opening path %s", ctx->root_path);
+    cio_log_debug(ctx, "[cio scan] opening path %s", ctx->options.root_path);
 
     /* Iterate the root_path */
     while ((ent = readdir(dir)) != NULL) {
@@ -157,7 +172,7 @@ void cio_scan_dump(struct cio_ctx *ctx)
     struct mk_list *head;
     struct cio_stream *st;
 
-    cio_log_info(ctx, "scan dump of %s", ctx->root_path);
+    cio_log_info(ctx, "scan dump of %s", ctx->options.root_path);
 
     /* Iterate streams */
     mk_list_foreach(head, &ctx->streams) {

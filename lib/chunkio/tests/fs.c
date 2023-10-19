@@ -33,6 +33,7 @@
 #include <chunkio/cio_stream.h>
 #include <chunkio/cio_utils.h>
 #include <chunkio/cio_error.h>
+#include <chunkio/cio_file_native.h>
 
 #include "cio_tests_internal.h"
 
@@ -66,17 +67,24 @@ static void test_fs_write()
     struct cio_stream *stream;
     struct cio_chunk *chunk;
     struct cio_chunk **carr;
+    struct cio_options cio_opts;
 
     /* Dummy break line for clarity on acutest output */
     printf("\n");
 
     flags = CIO_CHECKSUM;
 
+    cio_options_init(&cio_opts);
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.flags = flags;
+
     /* cleanup environment */
     cio_utils_recursive_delete(CIO_ENV);
 
     /* Create main context */
-    ctx = cio_create(CIO_ENV, log_cb, CIO_LOG_INFO, flags);
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
 
     /* Try to create a file with an invalid stream */
@@ -152,8 +160,15 @@ static void test_fs_write()
     free(in_data);
     cio_destroy(ctx);
 
+    cio_options_init(&cio_opts);
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_INFO;
+    cio_opts.flags = flags;
+
     /* Create new context using the data generated above */
-    ctx = cio_create(CIO_ENV, log_cb, CIO_LOG_INFO, flags);
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
     cio_scan_dump(ctx);
     cio_destroy(ctx);
@@ -175,6 +190,7 @@ static void test_fs_checksum()
     struct cio_ctx *ctx;
     struct cio_stream *stream;
     struct cio_chunk *chunk;
+    struct cio_options cio_opts;
 
     /*
      * crc32 checksums
@@ -205,7 +221,13 @@ static void test_fs_checksum()
     /* cleanup environment */
     cio_utils_recursive_delete(CIO_ENV);
 
-    ctx = cio_create(CIO_ENV, log_cb, CIO_LOG_INFO, flags);
+    cio_options_init(&cio_opts);
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.flags = flags;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
 
     stream = cio_stream_create(ctx, "test-crc32", CIO_STORE_FS);
@@ -282,6 +304,7 @@ static void test_fs_up_down()
     struct cio_ctx *ctx;
     struct cio_stream *stream;
     struct cio_chunk *chunk;
+    struct cio_options cio_opts;
 
     /*
      * crc32 checksums
@@ -312,7 +335,14 @@ static void test_fs_up_down()
     /* cleanup environment */
     cio_utils_recursive_delete(CIO_ENV);
 
-    ctx = cio_create(CIO_ENV, log_cb, CIO_LOG_INFO, flags);
+    cio_options_init(&cio_opts);
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_INFO;
+    cio_opts.flags = flags;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
 
     stream = cio_stream_create(ctx, "test-crc32", CIO_STORE_FS);
@@ -408,9 +438,17 @@ static void test_issue_51()
     int err;
     struct cio_ctx *ctx;
     struct cio_stream *stream;
+    struct cio_options cio_opts;
 
     /* Create a temporal storage */
-    ctx = cio_create("tmp", log_cb, CIO_LOG_DEBUG, 0);
+    cio_options_init(&cio_opts);
+
+    cio_opts.root_path = "tmp";
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_DEBUG;
+    cio_opts.flags = 0;
+
+    ctx = cio_create(&cio_opts);
     stream = cio_stream_create(ctx, "test", CIO_STORE_FS);
     cio_chunk_open(ctx, stream, "c", CIO_OPEN, 1000, &err);
     cio_destroy(ctx);
@@ -432,7 +470,7 @@ static void test_issue_51()
     close(fd);
 
     /* Re-read the content */
-    ctx = cio_create("tmp", log_cb, CIO_LOG_DEBUG, 0);
+    ctx = cio_create(&cio_opts);
 
     /* Upon scanning an existing stream, if not fixed, the program crashes */
     stream = cio_stream_create(ctx, "test", CIO_STORE_FS);
@@ -451,11 +489,19 @@ static void test_issue_flb_2025()
     struct cio_ctx *ctx;
     struct cio_chunk *chunk;
     struct cio_stream *stream;
+    struct cio_options cio_opts;
 
     cio_utils_recursive_delete("tmp");
 
     /* Create a temporal storage */
-    ctx = cio_create("tmp", log_cb, CIO_LOG_DEBUG, CIO_CHECKSUM);
+    cio_options_init(&cio_opts);
+
+    cio_opts.root_path = "tmp";
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_DEBUG;
+    cio_opts.flags = CIO_CHECKSUM;
+
+    ctx = cio_create(&cio_opts);
     stream = cio_stream_create(ctx, "test", CIO_STORE_FS);
     chunk = cio_chunk_open(ctx, stream, "c", CIO_OPEN, 1000, &err);
     TEST_CHECK(chunk != NULL);
@@ -493,12 +539,21 @@ void test_fs_size_chunks_up()
     struct cio_chunk *chunk;
     struct cio_chunk *chunk_tmp;
     struct cio_stream *stream;
+    struct cio_options cio_opts;
 
     /* cleanup environment */
     cio_utils_recursive_delete(CIO_ENV);
 
     flags = CIO_CHECKSUM;
-    ctx = cio_create(CIO_ENV, log_cb, CIO_LOG_INFO, flags);
+
+    cio_options_init(&cio_opts);
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_INFO;
+    cio_opts.flags = flags;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
 
     /* Set default number of chunks up */
@@ -584,12 +639,20 @@ void test_issue_write_at()
     struct cio_ctx *ctx;
     struct cio_chunk *chunk;
     struct cio_stream *stream;
+    struct cio_options cio_opts;
 
     /* cleanup environment */
     cio_utils_recursive_delete(CIO_ENV);
 
     /* create Chunk I/O context */
-    ctx = cio_create(CIO_ENV, log_cb, CIO_LOG_INFO, CIO_CHECKSUM);
+    cio_options_init(&cio_opts);
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_INFO;
+    cio_opts.flags = CIO_CHECKSUM;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
 
     /* Set default number of chunks up */
@@ -660,6 +723,247 @@ void test_issue_write_at()
     TEST_CHECK(cf->fd <= 0);
 }
 
+
+void test_fs_up_down_up_append()
+{
+    int ret;
+    int err;
+    struct cio_ctx *ctx;
+    struct cio_chunk *chunk;
+    struct cio_stream *stream;
+    struct cio_options cio_opts;
+
+    void *out_buf;
+    size_t out_size;
+
+    cio_utils_recursive_delete(CIO_ENV);
+
+    /* create Chunk I/O context */
+    cio_options_init(&cio_opts);
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_DEBUG;
+    cio_opts.flags = CIO_CHECKSUM;
+
+    /* Create a temporal storage */
+    ctx = cio_create(&cio_opts);
+    stream = cio_stream_create(ctx, "cio", CIO_STORE_FS);
+    chunk = cio_chunk_open(ctx, stream, "c", CIO_OPEN, 1000, &err);
+    TEST_CHECK(chunk != NULL);
+    if (!chunk) {
+        printf("cannot open chunk\n");
+        exit(1);
+    }
+
+    ret = cio_chunk_get_content_copy(chunk, &out_buf, &out_size);
+    TEST_CHECK(ret == CIO_OK);
+    TEST_CHECK(memcmp(out_buf, "", 1) == 0);
+    TEST_CHECK(out_size == 0);
+    free(out_buf);
+
+    ret = cio_chunk_write(chunk, "line 1\n", 7);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_get_content_copy(chunk, &out_buf, &out_size);
+    TEST_CHECK(ret == CIO_OK);
+    TEST_CHECK(memcmp(out_buf, "line 1\n", 7+1) == 0);
+    TEST_CHECK(out_size == 7);
+    free(out_buf);
+
+    ret = cio_chunk_down(chunk);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_up(chunk);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_get_content_copy(chunk, &out_buf, &out_size);
+    TEST_CHECK(ret == CIO_OK);
+    TEST_CHECK(memcmp(out_buf, "line 1\n", 7+1) == 0);
+    TEST_CHECK(out_size == 7);
+    free(out_buf);
+
+    /* append */
+    ret = cio_chunk_write(chunk, "line 2\n", 7);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_down(chunk);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_up(chunk);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_get_content_copy(chunk, &out_buf, &out_size);
+    TEST_CHECK(ret == CIO_OK);
+    TEST_CHECK(memcmp(out_buf, "line 1\nline 2\n", 7*2+1) == 0);
+    TEST_CHECK(out_size == 7*2);
+    free(out_buf);
+
+    cio_destroy(ctx);
+}
+
+static void test_deep_hierarchy()
+{
+    int i;
+    int ret;
+    int err;
+    int len;
+    char line[] = "this is a test line\n";
+    struct cio_ctx *ctx;
+    struct cio_chunk *chunk;
+    struct cio_stream *stream;
+    struct cio_options cio_opts;
+
+    cio_utils_recursive_delete("tmp");
+
+    /* Create a temporal storage */
+    cio_options_init(&cio_opts);
+
+    cio_opts.root_path = "tmp/deep/log/dir";
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_DEBUG;
+    cio_opts.flags = 0;
+
+    ctx = cio_create(&cio_opts);
+    stream = cio_stream_create(ctx, "test", CIO_STORE_FS);
+    chunk = cio_chunk_open(ctx, stream, "c", CIO_OPEN, 1000, &err);
+    TEST_CHECK(chunk != NULL);
+    if (!chunk) {
+        printf("cannot open chunk\n");
+        exit(1);
+    }
+
+    len = strlen(line);
+    for (i = 0; i < 1000; i++) {
+        ret = cio_chunk_write(chunk, line, len);
+        TEST_CHECK(ret == CIO_OK);
+
+        ret = cio_chunk_down(chunk);
+        TEST_CHECK(ret == CIO_OK);
+
+        ret = cio_chunk_up(chunk);
+        TEST_CHECK(ret == CIO_OK);
+    }
+
+    cio_destroy(ctx);
+}
+
+static void truncate_file(struct cio_file *chunk_file,
+                          size_t new_file_size,
+                          int remove_content_length)
+{
+    int result;
+
+    result = cio_file_native_open(chunk_file);
+    TEST_CHECK(result == CIO_OK);
+
+    result = cio_file_native_map(chunk_file,
+                                 chunk_file->page_size);
+    TEST_CHECK(result == CIO_OK);
+
+    if (remove_content_length) {
+        chunk_file->map[CIO_FILE_CONTENT_LENGTH_OFFSET + 0] = 0;
+        chunk_file->map[CIO_FILE_CONTENT_LENGTH_OFFSET + 1] = 0;
+        chunk_file->map[CIO_FILE_CONTENT_LENGTH_OFFSET + 2] = 0;
+        chunk_file->map[CIO_FILE_CONTENT_LENGTH_OFFSET + 3] = 0;
+    }
+
+    result = cio_file_native_unmap(chunk_file);
+    TEST_CHECK(result == CIO_OK);
+
+    result = cio_file_native_resize(chunk_file, new_file_size);
+    TEST_CHECK(result == 0);
+
+    result = cio_file_native_close(chunk_file);
+    TEST_CHECK(result == CIO_OK);
+}
+
+static void test_legacy_core(int trigger_checksum_error)
+{
+    struct cio_options cio_opts;
+    char              *in_data;
+    size_t             in_size;
+    struct cio_stream *stream;
+    struct cio_chunk  *chunk;
+    size_t             delta;
+    struct cio_ctx    *ctx;
+    int                ret;
+
+    /* delete any previous temporary content directory */
+    cio_utils_recursive_delete(CIO_ENV);
+     /*
+     * Load sample data file and with the same content through multiple write
+     * operations generating other files.
+     */
+    ret = cio_utils_read_file(CIO_FILE_400KB, &in_data, &in_size);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* create Chunk I/O context */
+    cio_options_init(&cio_opts);
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_DEBUG;
+    cio_opts.flags = CIO_CHECKSUM;
+
+    /* Create a temporal storage */
+    ctx = cio_create(&cio_opts);
+
+    stream = cio_stream_create(ctx, "test-legacy", CIO_STORE_FS);
+
+    /* do not force a maximum of chunks up, we want to test writing overhead */
+    cio_set_max_chunks_up(ctx, 1);
+
+    chunk = cio_chunk_open(ctx,
+                           stream,
+                           "test_chunk",
+                           CIO_OPEN,
+                           1000,
+                           &ret);
+
+    ret = cio_chunk_write(chunk, in_data, 128);
+    TEST_CHECK(ret == 0);
+
+    ret = cio_chunk_down(chunk);
+    TEST_CHECK(ret == CIO_OK);
+
+    delta = CIO_FILE_HEADER_MIN;
+
+    if (trigger_checksum_error) {
+        delta++;
+    }
+
+    truncate_file((struct cio_file *) chunk->backend,
+                  128 + delta,
+                  CIO_TRUE);
+
+    ret = cio_chunk_up(chunk);
+
+    if (trigger_checksum_error) {
+        TEST_CHECK(ret != CIO_OK);
+    }
+    else {
+        TEST_CHECK(ret == CIO_OK);
+    }
+
+    cio_destroy(ctx);
+
+    free(in_data);
+}
+
+void test_legacy_success()
+{
+    test_legacy_core(CIO_FALSE);
+}
+
+void test_legacy_failure()
+{
+    test_legacy_core(CIO_TRUE);
+}
+
 TEST_LIST = {
     {"fs_write",   test_fs_write},
     {"fs_checksum",  test_fs_checksum},
@@ -668,5 +972,9 @@ TEST_LIST = {
     {"issue_51",   test_issue_51},
     {"issue_flb_2025", test_issue_flb_2025},
     {"issue_write_at", test_issue_write_at},
+    {"fs_up_down_up_append", test_fs_up_down_up_append},
+    {"fs_deep_hierachy", test_deep_hierarchy},
+    {"legacy_success", test_legacy_success},
+    {"legacy_failure", test_legacy_failure},
     { 0 }
 };

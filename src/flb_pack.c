@@ -36,9 +36,19 @@
 #include <cmetrics/cmt_encode_text.h>
 
 #include <msgpack.h>
+#include <math.h>
 #include <jsmn/jsmn.h>
 
 #define try_to_write_str  flb_utils_write_str
+
+static int convert_nan_to_null = FLB_FALSE;
+
+static int flb_pack_set_null_as_nan(int b) {
+    if (b == FLB_TRUE || b == FLB_FALSE) {
+        convert_nan_to_null = b;
+    }
+    return convert_nan_to_null;
+}
 
 int flb_json_tokenise(const char *js, size_t len,
                       struct flb_pack_state *state)
@@ -229,7 +239,8 @@ static char *tokens_to_msgpack(struct flb_pack_state *state,
  * JSON messages.
  */
 static int pack_json_to_msgpack(const char *js, size_t len, char **buffer,
-                                size_t *size, int *root_type, int *records)
+                                size_t *size, int *root_type, int *records,
+                                size_t *consumed)
 {
     int ret = -1;
     int n_records;
@@ -263,6 +274,11 @@ static int pack_json_to_msgpack(const char *js, size_t len, char **buffer,
     *size = out;
     *buffer = buf;
     *records = n_records;
+
+    if (consumed != NULL) {
+        *consumed = last;
+    }
+
     ret = 0;
 
  flb_pack_json_end:
@@ -272,11 +288,11 @@ static int pack_json_to_msgpack(const char *js, size_t len, char **buffer,
 
 /* Pack unlimited serialized JSON messages into msgpack */
 int flb_pack_json(const char *js, size_t len, char **buffer, size_t *size,
-                  int *root_type)
+                  int *root_type, size_t *consumed)
 {
     int records;
 
-    return pack_json_to_msgpack(js, len, buffer, size, root_type, &records);
+    return pack_json_to_msgpack(js, len, buffer, size, root_type, &records, consumed);
 }
 
 /*
@@ -284,9 +300,9 @@ int flb_pack_json(const char *js, size_t len, char **buffer, size_t *size,
  * 'out_records' the number of messages.
  */
 int flb_pack_json_recs(const char *js, size_t len, char **buffer, size_t *size,
-                       int *root_type, int *out_records)
+                       int *root_type, int *out_records, size_t *consumed)
 {
-    return pack_json_to_msgpack(js, len, buffer, size, root_type, out_records);
+    return pack_json_to_msgpack(js, len, buffer, size, root_type, out_records, consumed);
 }
 
 /* Initialize a JSON packer state */
@@ -312,6 +328,7 @@ int flb_pack_state_init(struct flb_pack_state *s)
     if (!s->buf_data) {
         flb_errno();
         flb_free(s->tokens);
+        s->tokens = NULL;
         return -1;
     }
     s->buf_size = size;
@@ -323,11 +340,13 @@ int flb_pack_state_init(struct flb_pack_state *s)
 void flb_pack_state_reset(struct flb_pack_state *s)
 {
     flb_free(s->tokens);
+    s->tokens = NULL;
     s->tokens_size  = 0;
     s->tokens_count = 0;
     s->last_byte    = 0;
     s->buf_size     = 0;
     flb_free(s->buf_data);
+    s->buf_data = NULL;
 }
 
 
@@ -361,30 +380,39 @@ int flb_pack_json_state(const char *js, size_t len,
          * are OK in the array of tokens, if any, process them and adjust
          * the JSMN context/buffers.
          */
+
+        /*
+         * jsmn_parse updates jsmn_parser members. (state->parser)
+         * A member 'toknext' points next incomplete object token.
+         * We use toknext - 1 as an index of last member of complete JSON.
+         */
         int i;
         int found = 0;
 
-        for (i = 1; i < state->tokens_count; i++) {
+        if (state->parser.toknext == 0) {
+            return ret;
+        }
+
+        for (i = (int)state->parser.toknext - 1; i >= 1; i--) {
             t = &state->tokens[i];
 
             if (t->parent == -1 && (t->end != 0)) {
                 found++;
                 delim = i;
+                break;
             }
         }
 
-        if (found > 0) {
-            state->tokens_count += delim;
+        if (found == 0) {
+            return ret; /* FLB_ERR_JSON_PART */
         }
-        else {
-            return ret;
-        }
+        state->tokens_count += delim;
     }
     else if (ret != 0) {
         return ret;
     }
 
-    if (state->tokens_count == 0) {
+    if (state->tokens_count == 0 || state->tokens == NULL) {
         state->last_byte = last;
         return FLB_ERR_JSON_INVAL;
     }
@@ -401,20 +429,43 @@ int flb_pack_json_state(const char *js, size_t len,
     return 0;
 }
 
+int flb_metadata_pop_from_msgpack(msgpack_object **metadata, msgpack_unpacked *upk,
+                                  msgpack_object **map)
+{
+    if (metadata == NULL || upk == NULL) {
+        return -1;
+    }
+
+    if (upk->data.type != MSGPACK_OBJECT_ARRAY) {
+        return -1;
+    }
+
+    *metadata = &upk->data.via.array.ptr[0].via.array.ptr[1];
+    *map = &upk->data.via.array.ptr[1];
+
+    return 0;
+}
+
 static int pack_print_fluent_record(size_t cnt, msgpack_unpacked result)
 {
-    msgpack_object o;
-    msgpack_object *obj;
-    msgpack_object root;
-    struct flb_time tms;
+    msgpack_object  *metadata;
+    msgpack_object   root;
+    msgpack_object  *obj;
+    struct flb_time  tms;
+    msgpack_object   o;
 
     root = result.data;
     if (root.type != MSGPACK_OBJECT_ARRAY) {
         return -1;
     }
 
-    /* decode expected timestamp only (integer, float or ext) */
     o = root.via.array.ptr[0];
+    if (o.type != MSGPACK_OBJECT_ARRAY) {
+        return -1;
+    }
+
+    /* decode expected timestamp only (integer, float or ext) */
+    o = o.via.array.ptr[0];
     if (o.type != MSGPACK_OBJECT_POSITIVE_INTEGER &&
         o.type != MSGPACK_OBJECT_FLOAT &&
         o.type != MSGPACK_OBJECT_EXT) {
@@ -423,10 +474,17 @@ static int pack_print_fluent_record(size_t cnt, msgpack_unpacked result)
 
     /* This is a Fluent Bit record, just do the proper unpacking/printing */
     flb_time_pop_from_msgpack(&tms, &result, &obj);
+    flb_metadata_pop_from_msgpack(&metadata, &result, &obj);
 
     fprintf(stdout, "[%zd] [%"PRIu32".%09lu, ", cnt,
             (uint32_t) tms.tm.tv_sec, tms.tm.tv_nsec);
+
+    msgpack_object_print(stdout, *metadata);
+
+    fprintf(stdout, ", ");
+
     msgpack_object_print(stdout, *obj);
+
     fprintf(stdout, "]\n");
 
     return 0;
@@ -457,7 +515,7 @@ void flb_pack_print_metrics(const char *data, size_t bytes)
 {
     int ret;
     size_t off = 0;
-    cmt_sds_t text;
+    cfl_sds_t text;
     struct cmt *cmt = NULL;
 
     /* get cmetrics context */
@@ -477,7 +535,6 @@ void flb_pack_print_metrics(const char *data, size_t bytes)
     fflush(stdout);
 
     cmt_encode_text_destroy(text);
-
 }
 
 static inline int try_to_write(char *buf, int *off, size_t left,
@@ -567,6 +624,9 @@ static int msgpack2json(char *buf, int *off, size_t left,
             char temp[512] = {0};
             if (o->via.f64 == (double)(long long int)o->via.f64) {
                 i = snprintf(temp, sizeof(temp)-1, "%.1f", o->via.f64);
+            }
+            else if (convert_nan_to_null && isnan(o->via.f64) ) {
+                i = snprintf(temp, sizeof(temp)-1, "null");
             }
             else {
                 i = snprintf(temp, sizeof(temp)-1, "%.16g", o->via.f64);
@@ -723,8 +783,8 @@ flb_sds_t flb_msgpack_raw_to_json_sds(const void *in_buf, size_t in_size)
     flb_sds_t tmp_buf;
 
     /* buffer size strategy */
-    out_size = in_size * 2;
-    realloc_size = in_size * 0.10;
+    out_size = in_size * FLB_MSGPACK_TO_JSON_INIT_BUFFER_SIZE;
+    realloc_size = in_size * FLB_MSGPACK_TO_JSON_REALLOC_BUFFER_SIZE;
     if (realloc_size < 256) {
         realloc_size = 256;
     }
@@ -808,23 +868,60 @@ int flb_pack_to_json_date_type(const char *str)
     else if (strcasecmp(str, "epoch") == 0) {
         return FLB_PACK_JSON_DATE_EPOCH;
     }
+    else if (strcasecmp(str, "epoch_ms") == 0 ||
+             strcasecmp(str, "epoch_millis") == 0 ||
+             strcasecmp(str, "epoch_milliseconds") == 0) {
+        return FLB_PACK_JSON_DATE_EPOCH_MS;
+    }
 
     return -1;
 }
 
+
+static int msgpack_pack_formatted_datetime(flb_sds_t out_buf, char time_formatted[], int max_len,
+                                           msgpack_packer* tmp_pck, struct flb_time* tms,
+                                           const char *date_format,
+                                           const char *time_format)
+{
+    int len;
+    size_t s;
+    struct tm tm;
+
+    gmtime_r(&tms->tm.tv_sec, &tm);
+
+    s = strftime(time_formatted, max_len,
+                 date_format, &tm);
+    if (!s) {
+        flb_debug("strftime failed in flb_pack_msgpack_to_json_format");
+        return 1;
+    }
+
+    /* Format the time, use microsecond precision not nanoseconds */
+    max_len -= s;
+    len = snprintf(&time_formatted[s],
+                    max_len,
+                    time_format,
+                    (uint64_t) tms->tm.tv_nsec / 1000);
+    if (len >= max_len) {
+        flb_debug("snprintf: %d >= %d in flb_pack_msgpack_to_json_format", len, max_len);
+        return 2;
+    }
+    s += len;
+    msgpack_pack_str(tmp_pck, s);
+    msgpack_pack_str_body(tmp_pck, time_formatted, s);
+    return 0;
+}
 
 flb_sds_t flb_pack_msgpack_to_json_format(const char *data, uint64_t bytes,
                                           int json_format, int date_format,
                                           flb_sds_t date_key)
 {
     int i;
-    int len;
     int ok = MSGPACK_UNPACK_SUCCESS;
     int records = 0;
     int map_size;
     size_t off = 0;
-    char time_formatted[32];
-    size_t s;
+    char time_formatted[38];
     flb_sds_t out_tmp;
     flb_sds_t out_js;
     flb_sds_t out_buf = NULL;
@@ -836,7 +933,6 @@ flb_sds_t flb_pack_msgpack_to_json_format(const char *data, uint64_t bytes,
     msgpack_object *obj;
     msgpack_object *k;
     msgpack_object *v;
-    struct tm tm;
     struct flb_time tms;
 
     /* For json lines and streams mode we need a pre-allocated buffer */
@@ -866,7 +962,6 @@ flb_sds_t flb_pack_msgpack_to_json_format(const char *data, uint64_t bytes,
     if (json_format == FLB_PACK_JSON_FORMAT_JSON) {
         records = flb_mp_count(data, bytes);
         if (records <= 0) {
-            flb_sds_destroy(out_buf);
             msgpack_sbuffer_destroy(&tmp_sbuf);
             return NULL;
         }
@@ -912,35 +1007,28 @@ flb_sds_t flb_pack_msgpack_to_json_format(const char *data, uint64_t bytes,
                 msgpack_pack_double(&tmp_pck, flb_time_to_double(&tms));
                 break;
             case FLB_PACK_JSON_DATE_JAVA_SQL_TIMESTAMP:
-            /* Format the time, use microsecond precision not nanoseconds */
-                gmtime_r(&tms.tm.tv_sec, &tm);
-                s = strftime(time_formatted, sizeof(time_formatted) - 1,
-                             FLB_PACK_JSON_DATE_JAVA_SQL_TIMESTAMP_FMT, &tm);
-
-                len = snprintf(time_formatted + s,
-                               sizeof(time_formatted) - 1 - s,
-                               ".%06" PRIu64,
-                               (uint64_t) tms.tm.tv_nsec / 1000);
-                s += len;
-                msgpack_pack_str(&tmp_pck, s);
-                msgpack_pack_str_body(&tmp_pck, time_formatted, s);
+                if (msgpack_pack_formatted_datetime(out_buf, time_formatted, sizeof(time_formatted), &tmp_pck, &tms,
+                                                    FLB_PACK_JSON_DATE_JAVA_SQL_TIMESTAMP_FMT, ".%06" PRIu64)) {
+                    flb_sds_destroy(out_buf);
+                    msgpack_sbuffer_destroy(&tmp_sbuf);
+                    msgpack_unpacked_destroy(&result);
+                    return NULL;
+                }
                 break;
             case FLB_PACK_JSON_DATE_ISO8601:
-            /* Format the time, use microsecond precision not nanoseconds */
-                gmtime_r(&tms.tm.tv_sec, &tm);
-                s = strftime(time_formatted, sizeof(time_formatted) - 1,
-                             FLB_PACK_JSON_DATE_ISO8601_FMT, &tm);
-
-                len = snprintf(time_formatted + s,
-                               sizeof(time_formatted) - 1 - s,
-                               ".%06" PRIu64 "Z",
-                               (uint64_t) tms.tm.tv_nsec / 1000);
-                s += len;
-                msgpack_pack_str(&tmp_pck, s);
-                msgpack_pack_str_body(&tmp_pck, time_formatted, s);
+                if (msgpack_pack_formatted_datetime(out_buf, time_formatted, sizeof(time_formatted), &tmp_pck, &tms,
+                                                    FLB_PACK_JSON_DATE_ISO8601_FMT, ".%06" PRIu64 "Z")) {
+                    flb_sds_destroy(out_buf);
+                    msgpack_sbuffer_destroy(&tmp_sbuf);
+                    msgpack_unpacked_destroy(&result);
+                    return NULL;
+                }
                 break;
             case FLB_PACK_JSON_DATE_EPOCH:
                 msgpack_pack_uint64(&tmp_pck, (long long unsigned)(tms.tm.tv_sec));
+                break;
+            case FLB_PACK_JSON_DATE_EPOCH_MS:
+                msgpack_pack_uint64(&tmp_pck, flb_time_to_millisec(&tms));
                 break;
             }
         }
@@ -1167,4 +1255,16 @@ int flb_msgpack_expand_map(char *map_data, size_t map_size,
     msgpack_sbuffer_destroy(&sbuf);
 
     return 0;
+}
+
+int flb_pack_init(struct flb_config *config)
+{
+    int ret;
+
+    if (config == NULL) {
+        return -1;
+    }
+    ret = flb_pack_set_null_as_nan(config->convert_nan_to_null);
+
+    return ret;
 }

@@ -22,6 +22,7 @@
 
 #include <fluent-bit/flb_io.h>
 #include <fluent-bit/flb_upstream.h>
+#include <fluent-bit/flb_callback.h>
 
 /* Buffer size */
 #define FLB_HTTP_BUF_SIZE        2048
@@ -102,7 +103,7 @@ struct flb_http_debug {
 /* Set a request type */
 struct flb_http_client {
     /* Upstream connection */
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
 
     /* Request data */
     int method;
@@ -139,7 +140,7 @@ struct flb_http_client {
 void flb_http_client_debug(struct flb_http_client *c,
                            struct flb_callback *cb_ctx);
 
-struct flb_http_client *flb_http_client(struct flb_upstream_conn *u_conn,
+struct flb_http_client *flb_http_client(struct flb_connection *u_conn,
                                         int method, const char *uri,
                                         const char *body, size_t body_len,
                                         const char *host, int port,
@@ -148,17 +149,21 @@ struct flb_http_client *flb_http_client(struct flb_upstream_conn *u_conn,
 int flb_http_add_header(struct flb_http_client *c,
                         const char *key, size_t key_len,
                         const char *val, size_t val_len);
+flb_sds_t flb_http_get_header(struct flb_http_client *c,
+                              const char *key, size_t key_len);
 int flb_http_basic_auth(struct flb_http_client *c,
                         const char *user, const char *passwd);
 int flb_http_proxy_auth(struct flb_http_client *c,
                         const char *user, const char *passwd);
+int flb_http_bearer_auth(struct flb_http_client *c,
+                        const char *token);
 int flb_http_set_keepalive(struct flb_http_client *c);
 int flb_http_set_content_encoding_gzip(struct flb_http_client *c);
 int flb_http_set_callback_context(struct flb_http_client *c,
                                   struct flb_callback *cb_ctx);
 
 int flb_http_do(struct flb_http_client *c, size_t *bytes);
-int flb_http_client_proxy_connect(struct flb_upstream_conn *u_conn);
+int flb_http_client_proxy_connect(struct flb_connection *u_conn);
 void flb_http_client_destroy(struct flb_http_client *c);
 int flb_http_buffer_size(struct flb_http_client *c, size_t size);
 size_t flb_http_buffer_available(struct flb_http_client *c);

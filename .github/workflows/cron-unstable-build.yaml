@@ -12,17 +12,13 @@ on:
 
   # Run nightly build at this time, bit of trial and error but this seems good.
   schedule:
-  - cron: "0 6 * * *"   # master build
-  - cron: "0 12 * * *"  # 1.9 build
-  # Not available currently so will fail until it is
-  - cron: "0 18 * * *"  # 1.8 build
-  # A 1.8 build requires merging all the changes from master to handle packaging from local
+    - cron: "0 6 * * *" # master build
+    - cron: "0 12 * * *" # 2.0 build
 
 # We do not want a new unstable build to run whilst we are releasing the current unstable build.
 concurrency: unstable-build-release
 
 jobs:
-
   # This job provides this metadata for the other jobs to use.
   unstable-build-get-meta:
     name: Get metadata to add to build
@@ -31,11 +27,13 @@ jobs:
     outputs:
       date: ${{ steps.date.outputs.date }}
       branch: ${{ steps.branch.outputs.branch }}
+    permissions:
+      contents: none
     steps:
       # For cron builds, i.e. nightly, we provide date and time as extra parameter to distinguish them.
       - name: Get current date
         id: date
-        run: echo "::set-output name=date::$(date '+%Y-%m-%d-%H_%M_%S')"
+        run: echo "date=$(date '+%Y-%m-%d-%H_%M_%S')" >> $GITHUB_OUTPUT
 
       - name: Debug event output
         uses: hmarr/debug-action@v2
@@ -48,21 +46,15 @@ jobs:
         shell: bash
 
       - name: master run
-        if:  github.event_name == 'schedule' && github.event.schedule=='0 6 * * *'
+        if: github.event_name == 'schedule' && github.event.schedule=='0 6 * * *'
         run: |
           echo "cron_branch=master" >> $GITHUB_ENV
         shell: bash
 
-      - name: 1.9 run
-        if:  github.event_name == 'schedule' && github.event.schedule=='0 12 * * *'
+      - name: 2.0 run
+        if: github.event_name == 'schedule' && github.event.schedule=='0 12 * * *'
         run: |
-          echo "cron_branch=1.9" >> $GITHUB_ENV
-        shell: bash
-
-      - name: 1.8 run
-        if:  github.event_name == 'schedule' && github.event.schedule=='0 18 * * *'
-        run: |
-          echo "cron_branch=1.8" >> $GITHUB_ENV
+          echo "cron_branch=2.0" >> $GITHUB_ENV
         shell: bash
 
       - name: Output the branch to use
@@ -73,12 +65,12 @@ jobs:
             echo "Unable to determine branch to use"
             exit 1
           fi
-          echo "::set-output name=branch::$cron_branch"
+          echo "branch=$cron_branch" >> $GITHUB_OUTPUT
         shell: bash
 
   unstable-build-images:
     needs: unstable-build-get-meta
-    uses: fluent/fluent-bit/.github/workflows/call-build-images.yaml@master
+    uses: ./.github/workflows/call-build-images.yaml
     with:
       version: ${{ needs.unstable-build-get-meta.outputs.branch }}
       ref: ${{ needs.unstable-build-get-meta.outputs.branch }}
@@ -98,20 +90,23 @@ jobs:
     outputs:
       build-matrix: ${{ steps.set-matrix.outputs.build-matrix }}
     environment: unstable
+    permissions:
+      contents: read
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Checkout repository, always latest for action
+        uses: actions/checkout@v4
+
       # Set up the list of target to build so we can pass the JSON to the reusable job
       - uses: ./.github/actions/generate-package-build-matrix
         id: set-matrix
         with:
-          fluent-bit-version: ${{ needs.unstable-build-get-meta.outputs.branch }}
+          ref: ${{ needs.unstable-build-get-meta.outputs.branch }}
 
   unstable-build-packages:
     needs:
       - unstable-build-get-meta
       - unstable-build-generate-matrix
-    uses: fluent/fluent-bit/.github/workflows/call-build-packages.yaml@master
+    uses: ./.github/workflows/call-build-linux-packages.yaml
     with:
       version: ${{ needs.unstable-build-get-meta.outputs.branch }}
       ref: ${{ needs.unstable-build-get-meta.outputs.branch }}
@@ -124,47 +119,29 @@ jobs:
   unstable-build-windows-package:
     needs:
       - unstable-build-get-meta
-    runs-on: windows-latest
-    environment: unstable
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-        with:
-          ref: ${{ needs.unstable-build-get-meta.outputs.branch }}
+    uses: ./.github/workflows/call-build-windows.yaml
+    with:
+      version: ${{ needs.unstable-build-get-meta.outputs.branch }}
+      ref: ${{ needs.unstable-build-get-meta.outputs.branch }}
+      environment: unstable
+      unstable: ${{ needs.unstable-build-get-meta.outputs.date }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Get dependencies
-        run: |
-          Invoke-WebRequest -O winflexbison.zip $env:WINFLEXBISON
-          Expand-Archive winflexbison.zip -Destination C:\WinFlexBison
-          Copy-Item -Path C:\WinFlexBison/win_bison.exe C:\WinFlexBison/bison.exe
-          Copy-Item -Path C:\WinFlexBison/win_flex.exe C:\WinFlexBison/flex.exe
-          echo "C:\WinFlexBison" | Out-File -FilePath $env:GITHUB_PATH -Append
-        env:
-          WINFLEXBISON: https://github.com/lexxmark/winflexbison/releases/download/v2.5.22/win_flex_bison-2.5.22.zip
-        shell: pwsh
+  unstable-build-macos-package:
+    needs:
+      - unstable-build-get-meta
+    uses: ./.github/workflows/call-build-macos.yaml
+    with:
+      version: ${{ needs.unstable-build-get-meta.outputs.branch }}
+      ref: ${{ needs.unstable-build-get-meta.outputs.branch }}
+      environment: unstable
+      unstable: ${{ needs.unstable-build-get-meta.outputs.date }}
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Visual Studio shell
-        uses: egor-tensin/vs-shell@v2
-        with:
-          arch: x64
-
-      - name: Build Fluent Bit packages
-        run: |
-          cmake -G "NMake Makefiles" ../
-          cmake --build .
-          cpack
-        working-directory: build
-
-      - name: Upload build packages
-        uses: actions/upload-artifact@v2
-        with:
-          name: windows-packages
-          path: |
-            build/fluent-bit-*.exe
-            build/fluent-bit-*.zip
-          if-no-files-found: error
-
-  # We already detain all artefacts as build output so just capture for an unstable release
+  # We already detain all artefacts as build output so just capture for an unstable release.
+  # We make all of these on a separate repo to prevent notification spam.
   unstable-release:
     runs-on: ubuntu-latest
     needs:
@@ -172,17 +149,18 @@ jobs:
       - unstable-build-images
       - unstable-build-packages
       - unstable-build-windows-package
+      - unstable-build-macos-package
     environment: unstable
     permissions:
-      contents: write
+      contents: read
     steps:
       # Required to make a release later
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Download all artefacts
         continue-on-error: true
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v3
         with:
           path: artifacts/
 
@@ -195,7 +173,7 @@ jobs:
         shell: bash
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v1
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -221,13 +199,15 @@ jobs:
 
       - name: Remove any existing release
         continue-on-error: true
-        run: gh release delete unstable-${{ needs.unstable-build-get-meta.outputs.branch }} --yes
+        run: gh release delete unstable-${{ needs.unstable-build-get-meta.outputs.branch }} --yes --repo ${{ secrets.RELEASE_REPO }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         shell: bash
 
       - name: Create Release
-        run: gh release create unstable-${{ needs.unstable-build-get-meta.outputs.branch }} release-upload/*.* --generate-notes --prerelease --target ${{ needs.unstable-build-get-meta.outputs.branch }} --title "Nightly unstable ${{ needs.unstable-build-get-meta.outputs.branch }} build"
+        # Do not fail the job here
+        continue-on-error: true
+        run: gh release create unstable-${{ needs.unstable-build-get-meta.outputs.branch }} release-upload/*.* --repo ${{ secrets.RELEASE_REPO }} --generate-notes --prerelease --target ${{ needs.unstable-build-get-meta.outputs.branch }} --title "Nightly unstable ${{ needs.unstable-build-get-meta.outputs.branch }} build"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         shell: bash

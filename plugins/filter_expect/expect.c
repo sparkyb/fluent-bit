@@ -24,6 +24,8 @@
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_utils.h>
+#include <fluent-bit/flb_log_event_decoder.h>
+#include <fluent-bit/flb_log_event_encoder.h>
 
 #include "expect.h"
 #include <msgpack.h>
@@ -171,6 +173,9 @@ static struct flb_expect *context_create(struct flb_filter_instance *ins,
         else if (strcasecmp(tmp, "exit") == 0) {
             ctx->action = FLB_EXP_EXIT;
         }
+        else if (strcasecmp(tmp, "result_key") == 0) {
+            ctx->action = FLB_EXP_RESULT_KEY;
+        }
         else {
             flb_plg_error(ctx->ins, "unexpected 'action' value '%s'", tmp);
             flb_free(ctx);
@@ -191,6 +196,11 @@ static struct flb_expect *context_create(struct flb_filter_instance *ins,
 
         /* Validate the type of the rule */
         type = key_to_type(kv->key);
+        if (strcasecmp(kv->key, "result_key") == 0) {
+            /* skip */
+            continue;
+        }
+
         if (type == -1 && strcasecmp(kv->key, "action") != 0) {
             flb_plg_error(ctx->ins, "unknown configuration rule '%s'", kv->key);
             context_destroy(ctx);
@@ -287,7 +297,7 @@ static int rule_apply(struct flb_expect *ctx, msgpack_object map)
                           "exception on rule #%i 'key_exists', key '%s' "
                           "not found. Record content:\n%s",
                           n, rule->value, json);
-            free(json);
+            flb_free(json);
             return FLB_FALSE;
         }
         else if (rule->type == FLB_EXP_KEY_NOT_EXISTS) {
@@ -300,7 +310,7 @@ static int rule_apply(struct flb_expect *ctx, msgpack_object map)
                           "exception on rule #%i 'key_not_exists', key '%s' "
                           "exists. Record content:\n%s",
                           n, rule->value, json);
-            free(json);
+            flb_free(json);
             flb_ra_key_value_destroy(val);
             return FLB_FALSE;
         }
@@ -311,7 +321,7 @@ static int rule_apply(struct flb_expect *ctx, msgpack_object map)
                               "exception on rule #%i 'key_val_is_null', "
                               "key '%s' not found. Record content:\n%s",
                               n, rule->value, json);
-                free(json);
+                flb_free(json);
                 return FLB_FALSE;
             }
             if (val->type != FLB_RA_NULL) {
@@ -322,7 +332,7 @@ static int rule_apply(struct flb_expect *ctx, msgpack_object map)
                               "Record content:\n%s",
                               n, rule->value,
                               ra_value_type_to_str(val), json);
-                free(json);
+                flb_free(json);
                 flb_ra_key_value_destroy(val);
                 return FLB_FALSE;
             }
@@ -335,7 +345,7 @@ static int rule_apply(struct flb_expect *ctx, msgpack_object map)
                               "exception on rule #%i 'key_val_is_not_null', "
                               "key '%s' not found. Record content:\n%s",
                               n, rule->value, json);
-                free(json);
+                flb_free(json);
                 return FLB_FALSE;
             }
             if (val->type == FLB_RA_NULL) {
@@ -346,7 +356,7 @@ static int rule_apply(struct flb_expect *ctx, msgpack_object map)
                               "Record content:\n%s",
                               n, rule->value,
                               ra_value_type_to_str(val), json);
-                free(json);
+                flb_free(json);
                 flb_ra_key_value_destroy(val);
                 return FLB_FALSE;
             }
@@ -359,7 +369,7 @@ static int rule_apply(struct flb_expect *ctx, msgpack_object map)
                               "exception on rule #%i 'key_val_is_null', "
                               "key '%s' not found. Record content:\n%s",
                               n, rule->value, json);
-                free(json);
+                flb_free(json);
                 return FLB_FALSE;
             }
 
@@ -372,7 +382,7 @@ static int rule_apply(struct flb_expect *ctx, msgpack_object map)
                                   "key value '%s' is different than "
                                   "expected: '%s'. Record content:\n%s",
                                   n, val->val.string, rule->expect, json);
-                    free(json);
+                    flb_free(json);
                     flb_ra_key_value_destroy(val);
                     return FLB_FALSE;
                 }
@@ -389,26 +399,38 @@ static int cb_expect_filter(const void *data, size_t bytes,
                             const char *tag, int tag_len,
                             void **out_buf, size_t *out_bytes,
                             struct flb_filter_instance *f_ins,
+                            struct flb_input_instance *i_ins,
                             void *filter_context,
                             struct flb_config *config)
 {
     int ret;
-    msgpack_unpacked result;
-    size_t off = 0;
+    int i;
+    int rule_matched = FLB_TRUE;
+    msgpack_object_kv *kv;
+    struct flb_expect *ctx = filter_context;
+    struct flb_log_event_encoder log_encoder;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+
     (void) out_buf;
     (void) out_bytes;
     (void) f_ins;
+    (void) i_ins;
     (void) config;
-    msgpack_object map;
-    msgpack_object root;
-    struct flb_expect *ctx = filter_context;
 
-    msgpack_unpacked_init(&result);
-    while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
-        root = result.data;
-        map = root.via.array.ptr[1];
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
 
-        ret = rule_apply(ctx, map);
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
+
+        return FLB_FILTER_NOTOUCH;
+    }
+
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+        ret = rule_apply(ctx, *log_event.body);
         if (ret == FLB_TRUE) {
             /* rule matches, we are good */
             continue;
@@ -420,10 +442,95 @@ static int cb_expect_filter(const void *data, size_t bytes,
             else if (ctx->action == FLB_EXP_EXIT) {
                 flb_engine_exit_status(config, 255);
             }
+            else if (ctx->action == FLB_EXP_RESULT_KEY) {
+                rule_matched = FLB_FALSE;
+            }
             break;
         }
     }
-    msgpack_unpacked_destroy(&result);
+
+    ret = 0;
+    /* Append result key when action is "result_key"*/
+    if (ctx->action == FLB_EXP_RESULT_KEY) {
+        flb_log_event_decoder_reset(&log_decoder, (char *) data, bytes);
+
+        ret = flb_log_event_encoder_init(&log_encoder,
+                                         FLB_LOG_EVENT_FORMAT_DEFAULT);
+
+        if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+            flb_plg_error(ctx->ins,
+                          "Log event encoder initialization error : %d", ret);
+
+            flb_log_event_decoder_destroy(&log_decoder);
+
+            return FLB_FILTER_NOTOUCH;
+        }
+
+        while ((ret = flb_log_event_decoder_next(
+                        &log_decoder,
+                        &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+            ret = flb_log_event_encoder_begin_record(&log_encoder);
+
+            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                ret = flb_log_event_encoder_set_timestamp(
+                        &log_encoder, &log_event.timestamp);
+            }
+
+            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                ret = flb_log_event_encoder_set_metadata_from_msgpack_object(&log_encoder,
+                        log_event.metadata);
+            }
+
+            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                ret = flb_log_event_encoder_append_body_values(
+                        &log_encoder,
+                        FLB_LOG_EVENT_STRING_VALUE(ctx->result_key, flb_sds_len(ctx->result_key)),
+                        FLB_LOG_EVENT_BOOLEAN_VALUE(rule_matched));
+            }
+
+            kv = log_event.body->via.map.ptr;
+            for (i=0 ;
+                 i < log_event.body->via.map.size &&
+                 ret == FLB_EVENT_ENCODER_SUCCESS ;
+                 i++) {
+                ret = flb_log_event_encoder_append_body_values(
+                        &log_encoder,
+                        FLB_LOG_EVENT_MSGPACK_OBJECT_VALUE(&kv[i].key),
+                        FLB_LOG_EVENT_MSGPACK_OBJECT_VALUE(&kv[i].val));
+            }
+
+            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                ret = flb_log_event_encoder_commit_record(&log_encoder);
+            }
+        }
+
+        if (ret == FLB_EVENT_DECODER_ERROR_INSUFFICIENT_DATA &&
+            log_decoder.offset == bytes) {
+            ret = FLB_EVENT_ENCODER_SUCCESS;
+        }
+
+        if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+            *out_buf   = log_encoder.output_buffer;
+            *out_bytes = log_encoder.output_length;
+
+            ret = FLB_FILTER_MODIFIED;
+
+            flb_log_event_encoder_claim_internal_buffer_ownership(&log_encoder);
+        }
+        else {
+            flb_plg_error(ctx->ins,
+                          "Log event encoder error : %d", ret);
+
+            ret = FLB_FILTER_NOTOUCH;
+        }
+
+        flb_log_event_decoder_destroy(&log_decoder);
+        flb_log_event_encoder_destroy(&log_encoder);
+
+        return ret;
+    }
+
+    flb_log_event_decoder_destroy(&log_decoder);
 
     return FLB_FILTER_NOTOUCH;
 }
@@ -483,7 +590,13 @@ static struct flb_config_map config_map[] =
     {
       FLB_CONFIG_MAP_STR, "action", "warn",
       0, FLB_FALSE, 0,
-      "action to take when a rule does not match: 'warn' or 'exit'"
+      "action to take when a rule does not match: 'warn', 'exit' or 'result_key'."
+    },
+    {
+      FLB_CONFIG_MAP_STR, "result_key", "matched",
+      0, FLB_TRUE, offsetof(struct flb_expect, result_key),
+      "specify the key name to append a boolean that indicates rule is matched or not. "
+      "This key is to be used only when 'action' is 'result_key'."
     },
 
     /* EOF */

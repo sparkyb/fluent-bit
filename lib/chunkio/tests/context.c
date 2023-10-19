@@ -25,7 +25,7 @@
 int log_check;
 
 /* Logging callback, once called it just turn on the log_check flag */
-static int log_cb(struct cio_ctx *ctx, const char *file, int line,
+static int log_cb(struct cio_ctx *ctx, int level, const char *file, int line,
                   char *str)
 {
     (void) ctx;
@@ -42,24 +42,38 @@ static void test_context()
 {
     int flags;
     struct cio_ctx *ctx;
+    struct cio_options cio_opts;
 
     flags = CIO_CHECKSUM;
 
+    cio_options_init(&cio_opts);
+    cio_opts.flags = flags;
+
     /* Invalid path */
-    ctx = cio_create("", NULL, CIO_LOG_INFO, flags);
+    cio_opts.root_path = "";
+    cio_opts.log_level = CIO_LOG_INFO;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx == NULL);
 
     /* Invalid debug level -1 */
-    ctx = cio_create("/tmp/", NULL, -1, flags);
+    cio_opts.root_path = "/tmp/";
+    cio_opts.log_level = -1;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx == NULL);
 
     /* Invalid debug level 6 */
-    ctx = cio_create("/tmp/", NULL, 6, flags);
+    cio_opts.log_level = 6;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx == NULL);
 
     /* Valid context without callback */
     log_check = 0;
-    ctx = cio_create("/tmp/", NULL, CIO_LOG_INFO, flags);
+    cio_opts.log_level = CIO_LOG_INFO;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
     cio_log_info(ctx, "test");
     TEST_CHECK(log_check == 0);
@@ -67,7 +81,9 @@ static void test_context()
 
     /* Valid with context callback */
     log_check = 0;
-    ctx = cio_create("/tmp/", log_cb, CIO_LOG_INFO, flags);
+    cio_opts.log_cb = log_cb;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
     cio_log_info(ctx, "test");
     TEST_CHECK(log_check == 1);
@@ -77,10 +93,16 @@ static void test_context()
 static void test_log_level()
 {
     struct cio_ctx *ctx;
+    struct cio_options cio_opts;
+
+    cio_options_init(&cio_opts);
 
     /* Logging with unset callback at creation, but set later */
     log_check = 0;
-    ctx = cio_create("/tmp/", NULL, CIO_LOG_INFO, 0);
+    cio_opts.root_path = "/tmp/";
+    cio_opts.log_level = CIO_LOG_INFO;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
     cio_log_info(ctx, "test");
     TEST_CHECK(log_check == 0);
@@ -132,8 +154,29 @@ static void test_log_level()
     cio_destroy(ctx);
 }
 
+static void test_open_flags()
+{
+    struct cio_ctx *ctx;
+    struct cio_options cio_opts;
+
+    cio_options_init(&cio_opts);
+    TEST_CHECK(cio_opts.flags & CIO_OPEN_RW);
+
+    /* reset flags */
+    cio_opts.flags = 0;
+
+    /* check that after context creation a default has been set */
+    ctx = cio_create(&cio_opts);
+    TEST_CHECK(ctx != NULL);
+    TEST_CHECK(cio_opts.flags & CIO_OPEN_RW);
+    
+    /* destroy context */
+    cio_destroy(ctx);
+}
+
 TEST_LIST = {
     {"context",     test_context},
     {"log_level",   test_log_level},
+    {"open_flags",  test_open_flags},
     { 0 }
 };
